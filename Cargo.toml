@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["crates/lx-snip-core", "crates/lx-snippingtool"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["lx-snippingtool contributors"]
+description = "Windows 11 Snipping Tool clone for Linux desktops"
+
+[workspace.dependencies]
+lx-snip-core = { path = "crates/lx-snip-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tiny-skia = "0.11"
+image = "0.25"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+ashpd = "0.10"
+pipewire = "0.8"
+zbus = "5"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+x11rb = { version = "0.13", features = ["shm", "randr", "xfixes"] }
+wl-clipboard-rs = "0.9"
+ksni = { version = "0.3", features = ["blocking"] }
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "canvas", "image", "svg", "tokio", "multi-window"] }
+iced_layershell = "0.12"
+directories = "5"
+libc = "0.2"

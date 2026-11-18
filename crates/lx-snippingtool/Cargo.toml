@@ -1,0 +1,59 @@
+[package]
+name = "lx-snippingtool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "lx-snippingtool"
+path = "src/main.rs"
+
+[dependencies]
+lx-snip-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+ashpd = { workspace = true }
+pipewire = { workspace = true }
+zbus = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true }
+x11rb = { workspace = true }
+wl-clipboard-rs = { workspace = true }
+ksni = { workspace = true }
+iced = { workspace = true }
+iced_layershell = { workspace = true }
+image = { workspace = true }
+tiny-skia = { workspace = true }
+directories = { workspace = true }
+libc = { workspace = true }
+uuid = { workspace = true }
+
+[package.metadata.deb]
+maintainer = "lx-snippingtool contributors"
+section = "utils"
+priority = "optional"
+depends = "libpipewire-0.3-0t64 | libpipewire-0.3-0, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libfontconfig1, xdg-desktop-portal, gstreamer1.0-tools, gstreamer1.0-pipewire, gstreamer1.0-plugins-good"
+assets = [
+    ["target/release/lx-snippingtool", "usr/bin/lx-snippingtool", "755"],
+    ["../../packaging/io.github.lx_snippingtool.SnippingTool.desktop", "usr/share/applications/io.github.lx_snippingtool.SnippingTool.desktop", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/lx-snippingtool", dest = "/usr/bin/lx-snippingtool", mode = "755" },
+    { source = "../../packaging/io.github.lx_snippingtool.SnippingTool.desktop", dest = "/usr/share/applications/io.github.lx_snippingtool.SnippingTool.desktop", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+pipewire-libs = "*"
+libwayland-client = "*"
+libxkbcommon = "*"
+gstreamer1-plugins-good = "*"
+pipewire-gstreamer = "*"
+libxkbcommon-x11 = "*"
+fontconfig = "*"
+xdg-desktop-portal = "*"

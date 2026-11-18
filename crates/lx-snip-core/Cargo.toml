@@ -1,0 +1,20 @@
+[package]
+name = "lx-snip-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core configuration, storage, annotation scene, export, platform traits, and telemetry for lx-snippingtool"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tiny-skia.workspace = true
+image.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-journald.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+directories.workspace = true

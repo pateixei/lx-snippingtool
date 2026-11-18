@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Snipping Tool
+GenericName=Screen Capture & Annotation
+Comment=Capture, annotate, and redact screen snips
+Exec=lx-snippingtool --mode rect
+Icon=accessories-screenshot
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=screenshot;snip;capture;annotation;redact;
+StartupWMClass=lx-snippingtool
+Actions=NewSnip;History;
+
+[Desktop Action NewSnip]
+Name=New Snip
+Exec=lx-snippingtool --mode rect
+
+[Desktop Action History]
+Name=Snip History
+Exec=lx-snippingtool --history
