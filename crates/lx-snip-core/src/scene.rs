@@ -1,36 +1,45 @@
-//! Retained-mode annotation and crop scene in image-pixel coordinates.
+//! Módulo: `scene`
+//! Objetivos: Manter a cena retida de anotações e recorte em coordenadas de pixel com suporte a desfazer/refazer e hit-testing de borracha.
+//! Principais itens: `Point`, `Rect`, `Color`, `ShapeKind`, `AnnotationOp` e `AnnotationScene`.
+//! Última alteração: 2026-11-19
 
-/// 2D point in image-pixel coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+/// Ponto 2D em coordenadas de pixel da imagem capturada.
+/// Armazena: coordenadas `x` e `y` | Principais métodos: `new`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
-    /// Horizontal coordinate in pixels.
+    /// Coordenada horizontal em pixels.
     pub x: f32,
-    /// Vertical coordinate in pixels.
+    /// Coordenada vertical em pixels.
     pub y: f32,
 }
 
 impl Point {
-    /// Creates a new [`Point`].
+    /// Cria um novo ponto `Point` nas coordenadas especificadas.
+    /// Input: coordenadas `x` e `y` em pixels | Output: instância de `Point`.
     pub const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
 }
 
-/// Axis-aligned rectangle in image-pixel coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Retângulo alinhado aos eixos em coordenadas de pixel da imagem.
+/// Armazena: origem `x`/`y` e dimensões `width`/`height` | Principais métodos: `new`, `normalized`, `contains`, `clamp`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
-    /// Left edge X coordinate.
+    /// Coordenada X da borda esquerda.
     pub x: f32,
-    /// Top edge Y coordinate.
+    /// Coordenada Y da borda superior.
     pub y: f32,
-    /// Rectangle width.
+    /// Largura do retângulo em pixels.
     pub width: f32,
-    /// Rectangle height.
+    /// Altura do retângulo em pixels.
     pub height: f32,
 }
 
 impl Rect {
-    /// Creates a new [`Rect`].
+    /// Cria um novo retângulo `Rect` a partir de origem e dimensões.
+    /// Input: `x`, `y`, `width` e `height` | Output: instância de `Rect`.
     pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self {
             x,
@@ -40,7 +49,8 @@ impl Rect {
         }
     }
 
-    /// Returns a normalized copy with non-negative `width` and `height`.
+    /// Retorna uma cópia normalizada garantindo largura e altura não negativas.
+    /// Input: `&self` | Output: `Rect` com `width >= 0.0` e `height >= 0.0`.
     pub fn normalized(&self) -> Self {
         let (x, width) = if self.width < 0.0 {
             (self.x + self.width, -self.width)
@@ -60,13 +70,15 @@ impl Rect {
         }
     }
 
-    /// Returns `true` if `point` lies within the normalized rectangle (inclusive).
+    /// Verifica se um ponto está contido dentro do retângulo normalizado (bordas inclusas).
+    /// Input: `&self` e `point` | Output: `true` se o ponto estiver dentro do retângulo.
     pub fn contains(&self, point: Point) -> bool {
         let r = self.normalized();
         point.x >= r.x && point.x <= r.x + r.width && point.y >= r.y && point.y <= r.y + r.height
     }
 
-    /// Clamps this rectangle to `[0, max_width] x [0, max_height]`.
+    /// Limita as coordenadas do retângulo aos limites `[0, max_width] x [0, max_height]`.
+    /// Input: `&self`, `max_width` e `max_height` | Output: `Rect` normalizado e recortado.
     pub fn clamp(&self, max_width: f32, max_height: f32) -> Self {
         let r = self.normalized();
         let x0 = r.x.clamp(0.0, max_width);
@@ -82,96 +94,103 @@ impl Rect {
     }
 }
 
-/// Straight RGBA8 color.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Representa uma cor RGBA8 não pré-multiplicada usada nas anotações.
+/// Armazena: canais `r`, `g`, `b` e `a` | Principais métodos: `rgb`, `rgba`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Color {
-    /// Red channel.
+    /// Canal vermelho.
     pub r: u8,
-    /// Green channel.
+    /// Canal verde.
     pub g: u8,
-    /// Blue channel.
+    /// Canal azul.
     pub b: u8,
-    /// Alpha channel.
+    /// Canal alfa (transparência).
     pub a: u8,
 }
 
 impl Color {
-    /// Opaque black.
+    /// Preto opaco padrão.
     pub const BLACK: Self = Self::rgb(0, 0, 0);
-    /// Opaque white.
+    /// Branco opaco padrão.
     pub const WHITE: Self = Self::rgb(255, 255, 255);
-    /// Opaque red.
+    /// Vermelho opaco padrão.
     pub const RED: Self = Self::rgb(220, 38, 38);
-    /// Opaque yellow.
+    /// Amarelo opaco padrão.
     pub const YELLOW: Self = Self::rgb(250, 204, 21);
 
-    /// Creates an opaque RGB color.
+    /// Cria uma cor RGB totalmente opaca (`a = 255`).
+    /// Input: canais `r`, `g` e `b` | Output: instância opaca de `Color`.
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 255 }
     }
 
-    /// Creates an RGBA color.
+    /// Cria uma cor RGBA com transparência explícita.
+    /// Input: canais `r`, `g`, `b` e `a` | Output: instância de `Color`.
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
     }
 }
 
-/// Supported geometric shape annotation kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Enumera as formas geométricas vetoriais suportadas pelo editor.
+/// Armazena: variantes `Rectangle`, `Ellipse`, `Arrow` e `Line` | Principais métodos: nenhum (tipo de dados).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeKind {
-    /// Axis-aligned rectangle outline.
+    /// Contorno de retângulo alinhado aos eixos.
     Rectangle,
-    /// Axis-aligned ellipse outline inscribed in the bounding box.
+    /// Contorno de elipse inscrita no retângulo delimitador.
     Ellipse,
-    /// Straight line with an arrowhead at `end`.
+    /// Segmento reto com ponta de seta em `end`.
     Arrow,
-    /// Straight line segment from `start` to `end`.
+    /// Segmento reto simples entre `start` e `end`.
     Line,
 }
 
-/// A single retained-mode annotation operation in image-pixel coordinates.
-#[derive(Debug, Clone, PartialEq)]
+/// Descreve uma operação retida individual de desenho ou redação na cena.
+/// Armazena: variantes `Pen`, `Highlighter`, `Shape` e `RedactBox` | Principais métodos: nenhum (tipo de dados).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnnotationOp {
-    /// Freehand opaque pen stroke.
+    /// Traço opaco à mão livre com caneta.
     Pen {
-        /// Polyline vertices in image-pixel coordinates.
+        /// Lista de vértices da polilinha em pixels da imagem.
         points: Vec<Point>,
-        /// Stroke color.
+        /// Cor do traço.
         color: Color,
-        /// Stroke width in pixels.
+        /// Espessura do traço em pixels.
         width: f32,
     },
-    /// Translucent highlighter stroke.
+    /// Traço translúcido de marca-texto.
     Highlighter {
-        /// Polyline vertices in image-pixel coordinates.
+        /// Lista de vértices da polilinha em pixels da imagem.
         points: Vec<Point>,
-        /// Base stroke color.
+        /// Cor base do marca-texto.
         color: Color,
-        /// Stroke width in pixels.
+        /// Espessura do traço em pixels.
         width: f32,
-        /// Opacity multiplier in `[0.0, 1.0]`.
+        /// Multiplicador de opacidade em `[0.0, 1.0]`.
         opacity: f32,
     },
-    /// Geometric shape defined by two drag endpoints.
+    /// Forma geométrica definida por ponto inicial e final do arrasto.
     Shape {
-        /// Shape variant.
+        /// Tipo de forma geométrica.
         kind: ShapeKind,
-        /// Drag start point.
+        /// Ponto inicial do arrasto.
         start: Point,
-        /// Drag end point.
+        /// Ponto final do arrasto.
         end: Point,
-        /// Stroke color.
+        /// Cor da borda da forma.
         color: Color,
-        /// Stroke width in pixels.
+        /// Espessura da linha em pixels.
         width: f32,
     },
-    /// Destructive solid redaction box.
+    /// Caixa sólida preta de redação destrutiva para ocultar conteúdo sensível.
     RedactBox {
-        /// Rectangle to overwrite with opaque black pixels on export.
+        /// Retângulo a ser sobrescrito permanentemente na exportação.
         rect: Rect,
     },
 }
 
+/// Registra mutações reversíveis da cena para as pilhas de `undo` e `redo`.
+/// Armazena: variantes `PushOp`, `EraseOp` e `SetCrop` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, PartialEq)]
 enum SceneAction {
     PushOp(AnnotationOp),
@@ -185,14 +204,15 @@ enum SceneAction {
     },
 }
 
-/// Retained-mode annotation scene independent of UI toolkit widgets.
+/// Mantém a cena retida de anotações, recorte e pilhas de histórico independentes de UI.
+/// Armazena: dimensões `base_width`/`base_height`, `crop_rect`, lista `ops` e pilhas `undo_stack`/`redo_stack` | Principais métodos: `new`, `push_op`, `set_crop`, `undo`, `redo`, `erase_at`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnotationScene {
-    /// Base image width in pixels.
+    /// Largura da imagem base em pixels.
     pub base_width: u32,
-    /// Base image height in pixels.
+    /// Altura da imagem base em pixels.
     pub base_height: u32,
-    /// Optional crop rectangle applied during export.
+    /// Retângulo opcional de recorte aplicado durante a exportação.
     pub crop_rect: Option<Rect>,
     ops: Vec<AnnotationOp>,
     undo_stack: Vec<SceneAction>,
@@ -200,7 +220,8 @@ pub struct AnnotationScene {
 }
 
 impl AnnotationScene {
-    /// Creates an empty [`AnnotationScene`] for an image of `base_width` x `base_height`.
+    /// Cria uma cena `AnnotationScene` vazia para uma imagem de `base_width` x `base_height`.
+    /// Input: `base_width` e `base_height` | Output: instância inicial de `AnnotationScene`.
     pub fn new(base_width: u32, base_height: u32) -> Self {
         Self {
             base_width,
@@ -212,19 +233,22 @@ impl AnnotationScene {
         }
     }
 
-    /// Returns the currently active annotation operations in draw order.
+    /// Retorna as operações ativas atualmente na cena em ordem de desenho.
+    /// Input: `&self` | Output: slice `&[AnnotationOp]`.
     pub fn ops(&self) -> &[AnnotationOp] {
         &self.ops
     }
 
-    /// Appends an annotation operation and records it on the undo stack.
+    /// Adiciona uma operação à cena, registra em `undo_stack` e limpa a pilha de refazer.
+    /// Input: `&mut self` e operação `op` | Output: cena atualizada.
     pub fn push_op(&mut self, op: AnnotationOp) {
         self.ops.push(op.clone());
         self.undo_stack.push(SceneAction::PushOp(op));
         self.redo_stack.clear();
     }
 
-    /// Updates the crop rectangle and records the change on the undo stack.
+    /// Atualiza o retângulo de recorte registrando a mudança para desfazer/refazer.
+    /// Input: `&mut self` e `crop` opcional | Output: cena atualizada.
     pub fn set_crop(&mut self, crop: Option<Rect>) {
         if self.crop_rect == crop {
             return;
@@ -236,17 +260,20 @@ impl AnnotationScene {
         self.redo_stack.clear();
     }
 
-    /// Returns `true` if there is an action available to undo.
+    /// Indica se existe ao menos uma ação disponível para desfazer.
+    /// Input: `&self` | Output: `true` quando `undo_stack` não está vazia.
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }
 
-    /// Returns `true` if there is an action available to redo.
+    /// Indica se existe ao menos uma ação disponível para refazer.
+    /// Input: `&self` | Output: `true` quando `redo_stack` não está vazia.
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
     }
 
-    /// Undoes the most recent scene mutation, returning `true` if state changed.
+    /// Desfaz a mutação mais recente da cena movendo-a para `redo_stack`.
+    /// Input: `&mut self` | Output: `true` se alguma ação foi desfeita.
     pub fn undo(&mut self) -> bool {
         let Some(action) = self.undo_stack.pop() else {
             return false;
@@ -269,7 +296,8 @@ impl AnnotationScene {
         true
     }
 
-    /// Reapplies the most recently undone scene mutation, returning `true` if state changed.
+    /// Reaplica a última ação desfeita restaurando-a para `undo_stack`.
+    /// Input: `&mut self` | Output: `true` se alguma ação foi reaplicada.
     pub fn redo(&mut self) -> bool {
         let Some(action) = self.redo_stack.pop() else {
             return false;
@@ -293,8 +321,8 @@ impl AnnotationScene {
         true
     }
 
-    /// Performs stroke-level hit-testing at `point` within `radius` pixels and removes
-    /// the topmost matching operation. Returns `true` if an operation was erased.
+    /// Testa colisão de traço no ponto indicado e remove a operação mais alta correspondente.
+    /// Input: `&mut self`, `point` em pixels e `radius` de tolerância | Output: `true` se apagou uma operação.
     pub fn erase_at(&mut self, point: Point, radius: f32) -> bool {
         let radius = radius.max(0.0);
         for idx in (0..self.ops.len()).rev() {
@@ -310,6 +338,8 @@ impl AnnotationScene {
     }
 }
 
+/// Verifica se o ponto de borracha atinge uma operação específica dentro do raio informado.
+/// Input: operação `op`, `point` e `radius` | Output: `true` em caso de interseção.
 fn hit_test_op(op: &AnnotationOp, point: Point, radius: f32) -> bool {
     match op {
         AnnotationOp::Pen { points, width, .. }
@@ -361,6 +391,8 @@ fn hit_test_op(op: &AnnotationOp, point: Point, radius: f32) -> bool {
     }
 }
 
+/// Testa se o ponto alvo está próximo de qualquer segmento de uma polilinha.
+/// Input: vértices `points`, ponto `target` e distância `threshold` | Output: `true` se colidir.
 fn hit_test_polyline(points: &[Point], target: Point, threshold: f32) -> bool {
     match points.len() {
         0 => false,
@@ -371,6 +403,8 @@ fn hit_test_polyline(points: &[Point], target: Point, threshold: f32) -> bool {
     }
 }
 
+/// Aproxima o contorno de uma elipse por segmentos e testa distância até `point`.
+/// Input: retângulo delimitador `rect`, `point` e `threshold` | Output: `true` se atingir a borda.
 fn hit_test_ellipse_outline(rect: Rect, point: Point, threshold: f32) -> bool {
     let rx = rect.width * 0.5;
     let ry = rect.height * 0.5;
@@ -404,6 +438,8 @@ fn hit_test_ellipse_outline(rect: Rect, point: Point, threshold: f32) -> bool {
     false
 }
 
+/// Calcula a menor distância euclidiana entre o ponto `p` e o segmento `a`-`b`.
+/// Input: pontos `p`, `a` e `b` | Output: distância escalar `f32` em pixels.
 fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
@@ -416,6 +452,8 @@ fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
     distance_sq(p, proj).sqrt()
 }
 
+/// Calcula o quadrado da distância euclidiana entre dois pontos.
+/// Input: pontos `a` e `b` | Output: distância ao quadrado `f32`.
 fn distance_sq(a: Point, b: Point) -> f32 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;

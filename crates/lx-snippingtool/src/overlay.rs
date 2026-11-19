@@ -1,5 +1,7 @@
-//! Multi-monitor freeze-frame selection overlay with cached static background,
-//! floating mode pill toolbar, and rectangular/freeform/window/fullscreen selection.
+//! Módulo: `overlay`
+//! Objetivos: Exibir o overlay congelado multimonitor de seleção visual (retângulo, livre, janela, tela cheia) e a barra flutuante de Nível 1 e Nível 2 para iniciar captura de imagem ou gravação de vídeo.
+//! Principais itens: `RecordTarget`, `OverlayMessage`, `OverlayOutcome`, `OverlayState`, `OverlayCanvas`, `crop_captured_selection`
+//! Última alteração: 2026-11-19
 
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
@@ -14,7 +16,8 @@ use crate::capture_x11::X11WindowBounds;
 use crate::icons;
 use crate::recorder::RecordingTarget;
 
-/// Target selection inside Level 2 of the Record menu.
+/// Alvo de gravação selecionado no menu de Nível 2 (`Gravar tela`).
+/// Armazena: variantes `Fullscreen`, `Rect` e `Window` | Principais métodos: nenhum (enumeração de seleção)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordTarget {
     /// Record the whole desktop / monitor (default).
@@ -25,11 +28,14 @@ pub enum RecordTarget {
     Window,
 }
 
-/// Messages emitted by the freeze-frame overlay.
+/// Mensagens de interação emitidas pelos controles da barra e pelo canvas do overlay.
+/// Armazena: variantes `SelectMode`, `BackToLevel1`, `SelectRecordTarget`, `StartRecordNow`, `ToggleSystemAudio`, `ToggleMic`, `SetDelay`, `PointerDown`, `PointerMove`, `PointerUp`, `ConfirmFullscreen`, `Cancel` | Principais métodos: nenhum (tipo de mensagem)
 #[derive(Debug, Clone)]
 pub enum OverlayMessage {
     /// Switch active capture mode in the Level 1 floating pill toolbar.
     SelectMode(CaptureMode),
+    /// Return from the Level 2 recording bar back to Level 1.
+    BackToLevel1,
     /// Select a Level 2 recording target (`Retângulo`, `Janela`, or `Fullscreen`).
     SelectRecordTarget(RecordTarget),
     /// Trigger the active Level 2 recording target immediately (`Iniciar gravação`).
@@ -52,7 +58,8 @@ pub enum OverlayMessage {
     Cancel,
 }
 
-/// Action returned by [`OverlayState::update`] when selection completes or cancels.
+/// Resultado final devolvido por `OverlayState::update` quando a seleção termina ou é cancelada.
+/// Armazena: variantes `Captured`, `CaptureWindowPortal`, `StartRecording` e `Cancelled` | Principais métodos: nenhum (enumeração de resultado)
 #[derive(Debug, Clone)]
 pub enum OverlayOutcome {
     /// Selection completed: cropped straight RGBA8 buffer + `(width, height)`.
@@ -79,7 +86,8 @@ pub enum OverlayOutcome {
     Cancelled,
 }
 
-/// State for the freeze-frame selection overlay.
+/// Estado completo do overlay de seleção congelada e da barra de ferramentas flutuante.
+/// Armazena: `captured`, `bg_handle`, `mode`, `supports_window_mode`, `x11_windows`, `hovered_window`, `drag_start`, `drag_current`, `lasso_points`, `delay_secs`, `record_target`, `record_system_audio`, `record_mic`, `dark_theme` | Principais métodos: `new`, `with_dark_theme`, `update`, `view`, `view_mode_bar`
 #[derive(Debug, Clone)]
 pub struct OverlayState {
     /// Full captured desktop image.
@@ -108,10 +116,13 @@ pub struct OverlayState {
     pub record_system_audio: bool,
     /// Whether microphone audio capture is toggled on in Record mode.
     pub record_mic: bool,
+    /// Whether the floating toolbar should use dark Adwaita colors matching the system theme.
+    pub dark_theme: bool,
 }
 
 impl OverlayState {
-    /// Creates a new [`OverlayState`] from a captured desktop image.
+    /// Inicializa o estado do overlay a partir da imagem desktop capturada e preferências iniciais.
+    /// Input: `captured` (`CapturedImage`), `mode` (`CaptureMode`), `delay_secs` (`u8`), `supports_window_mode` (`bool`), `x11_windows` (`Vec<X11WindowBounds>`) | Output: instância de `OverlayState`
     pub fn new(
         captured: CapturedImage,
         mode: CaptureMode,
@@ -138,9 +149,19 @@ impl OverlayState {
             record_target: RecordTarget::Fullscreen,
             record_system_audio: true,
             record_mic: false,
+            dark_theme: false,
         }
     }
 
+    /// Configura o esquema de cores claro ou escuro da barra flutuante acompanhando o tema do sistema.
+    /// Input: `mut self`, `dark` (`bool`) | Output: `Self` com `dark_theme` atualizado
+    pub fn with_dark_theme(mut self, dark: bool) -> Self {
+        self.dark_theme = dark;
+        self
+    }
+
+    /// Constrói o resultado `OverlayOutcome::StartRecording` herdando os toggles de áudio configurados no estado.
+    /// Input: `&self`, `target` (`RecordingTarget`) | Output: `Option<OverlayOutcome>` contendo `StartRecording`
     fn start_recording_outcome(&self, target: RecordingTarget) -> Option<OverlayOutcome> {
         Some(OverlayOutcome::StartRecording {
             target,
@@ -149,7 +170,8 @@ impl OverlayState {
         })
     }
 
-    /// Updates overlay state and returns an [`OverlayOutcome`] when the capture finishes or cancels.
+    /// Processa uma mensagem de interação do usuário e devolve o desfecho se a seleção foi concluída ou cancelada.
+    /// Input: `&mut self`, `msg` (`OverlayMessage`) | Output: `Option<OverlayOutcome>`
     pub fn update(&mut self, msg: OverlayMessage) -> Option<OverlayOutcome> {
         match msg {
             OverlayMessage::SelectMode(mode) => {
@@ -166,6 +188,14 @@ impl OverlayState {
                 } else if mode == CaptureMode::Fullscreen {
                     return self.finish_fullscreen();
                 }
+                None
+            }
+            OverlayMessage::BackToLevel1 => {
+                self.mode = CaptureMode::Rect;
+                self.drag_start = None;
+                self.drag_current = None;
+                self.lasso_points.clear();
+                self.hovered_window = None;
                 None
             }
             OverlayMessage::SelectRecordTarget(target) => {
@@ -337,6 +367,8 @@ impl OverlayState {
         }
     }
 
+    /// Localiza a janela X11 mais acima sob o ponteiro e limita seus limites às dimensões da captura.
+    /// Input: `&self`, `pt` (`Point`) | Output: `Option<Rect>` da janela sob o cursor
     fn find_window_at(&self, pt: Point) -> Option<Rect> {
         self.x11_windows
             .iter()
@@ -348,6 +380,8 @@ impl OverlayState {
             })
     }
 
+    /// Conclui a captura retornando a imagem inteira sem recorte para o modo tela cheia.
+    /// Input: `&self` | Output: `Option<OverlayOutcome>` com `OverlayOutcome::Captured`
     fn finish_fullscreen(&self) -> Option<OverlayOutcome> {
         Some(OverlayOutcome::Captured {
             rgba: self.captured.rgba.clone(),
@@ -356,6 +390,8 @@ impl OverlayState {
         })
     }
 
+    /// Recorta a região retangular ou poligonal selecionada da imagem capturada e devolve o resultado.
+    /// Input: `&self`, `rect` (`Rect`), `lasso` (`Option<&[Point]>`) | Output: `Option<OverlayOutcome>` ou `None` se a área for vazia
     fn finish_rect(&self, rect: Rect, lasso: Option<&[Point]>) -> Option<OverlayOutcome> {
         let (rgba, width, height) = crop_captured_selection(&self.captured, rect, lasso).ok()?;
         Some(OverlayOutcome::Captured {
@@ -365,7 +401,8 @@ impl OverlayState {
         })
     }
 
-    /// Renders the overlay for the given output geometry (or full desktop if `None`).
+    /// Monta a árvore de interface do overlay para a geometria do monitor especificado ou desktop completo.
+    /// Input: `&self`, `output` (`Option<&OutputGeometry>`) | Output: `Element<'_, OverlayMessage>`
     pub fn view(&self, output: Option<&OutputGeometry>) -> Element<'_, OverlayMessage> {
         let (ox, oy, ow, oh) = match output {
             Some(out) => (
@@ -417,97 +454,39 @@ impl OverlayState {
         }
     }
 
+    /// Constrói a pílula flutuante superior alternando entre o menu de captura de Nível 1 e o submenu de gravação de Nível 2.
+    /// Input: `&self` | Output: `Element<'_, OverlayMessage>`
     fn view_mode_bar(&self) -> Element<'_, OverlayMessage> {
-        let rect_btn = pill_icon_button(
-            icons::ICON_RECT,
-            "Retângulo",
-            self.mode == CaptureMode::Rect,
-            OverlayMessage::SelectMode(CaptureMode::Rect),
-        );
-        let free_btn = pill_icon_button(
-            icons::ICON_FREEFORM,
-            "Livre",
-            self.mode == CaptureMode::Freeform,
-            OverlayMessage::SelectMode(CaptureMode::Freeform),
-        );
-        let window_btn = pill_icon_button(
-            icons::ICON_WINDOW,
-            "Janela",
-            self.mode == CaptureMode::Window,
-            OverlayMessage::SelectMode(CaptureMode::Window),
-        );
-        let full_btn = pill_icon_button(
-            icons::ICON_FULLSCREEN,
-            "Fullscreen",
-            self.mode == CaptureMode::Fullscreen,
-            OverlayMessage::ConfirmFullscreen,
-        );
-        let record_btn = pill_icon_button(
-            icons::ICON_RECORD,
-            "Gravar tela",
-            self.mode == CaptureMode::Record,
-            OverlayMessage::SelectMode(CaptureMode::Record),
-        );
+        let palette = OverlayPalette::from_dark(self.dark_theme);
+        let cancel_btn = button(icons::icon(icons::ICON_CLOSE, 14.0, palette.fg))
+            .padding([6, 10])
+            .style(overlay_pill_btn(false, palette))
+            .on_press(OverlayMessage::Cancel);
 
-        let next_delay = match self.delay_secs {
-            0 => 3,
-            3 => 5,
-            5 => 10,
-            _ => 0,
-        };
-        let delay_label = if self.delay_secs == 0 {
-            "Delay: Off".to_string()
-        } else {
-            format!("Delay: {}s", self.delay_secs)
-        };
-        let delay_btn = button(
-            row![
-                icons::icon(icons::ICON_DELAY, 14.0, Color::from_rgb8(26, 26, 28)),
-                text(delay_label).size(13),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        )
-        .padding([6, 12])
-        .style(overlay_pill_btn(false))
-        .on_press(OverlayMessage::SetDelay(next_delay));
-
-        let cancel_btn = button(icons::icon(
-            icons::ICON_CLOSE,
-            14.0,
-            Color::from_rgb8(26, 26, 28),
-        ))
-        .padding([6, 10])
-        .style(overlay_pill_btn(false))
-        .on_press(OverlayMessage::Cancel);
-
-        let level1 =
-            row![rect_btn, free_btn, window_btn, full_btn, record_btn, delay_btn, cancel_btn]
-                .spacing(6)
-                .align_y(Alignment::Center);
-
-        let mut col = Column::new()
-            .push(level1)
-            .spacing(6)
-            .align_x(Alignment::Center);
-
-        if self.mode == CaptureMode::Record {
+        let bar = if self.mode == CaptureMode::Record {
+            let back_btn = button(icons::icon(icons::ICON_BACK, 14.0, palette.fg))
+                .padding([6, 10])
+                .style(overlay_pill_btn(false, palette))
+                .on_press(OverlayMessage::BackToLevel1);
             let rec_rect_btn = pill_icon_button(
                 icons::ICON_RECT,
                 "Retângulo",
                 self.record_target == RecordTarget::Rect,
+                palette,
                 OverlayMessage::SelectRecordTarget(RecordTarget::Rect),
             );
             let rec_win_btn = pill_icon_button(
                 icons::ICON_WINDOW,
                 "Janela",
                 self.record_target == RecordTarget::Window,
+                palette,
                 OverlayMessage::SelectRecordTarget(RecordTarget::Window),
             );
             let rec_full_btn = pill_icon_button(
                 icons::ICON_FULLSCREEN,
                 "Fullscreen",
                 self.record_target == RecordTarget::Fullscreen,
+                palette,
                 OverlayMessage::SelectRecordTarget(RecordTarget::Fullscreen),
             );
 
@@ -518,7 +497,7 @@ impl OverlayState {
             };
             let audio_btn = button(text(audio_label).size(13))
                 .padding([6, 12])
-                .style(overlay_pill_btn(self.record_system_audio))
+                .style(overlay_pill_btn(self.record_system_audio, palette))
                 .on_press(OverlayMessage::ToggleSystemAudio);
 
             let mic_label = if self.record_mic {
@@ -528,7 +507,7 @@ impl OverlayState {
             };
             let mic_btn = button(text(mic_label).size(13))
                 .padding([6, 12])
-                .style(overlay_pill_btn(self.record_mic))
+                .style(overlay_pill_btn(self.record_mic, palette))
                 .on_press(OverlayMessage::ToggleMic);
 
             let start_rec_btn = button(
@@ -543,40 +522,91 @@ impl OverlayState {
             .style(record_action_btn)
             .on_press(OverlayMessage::StartRecordNow);
 
-            let level2 = row![
+            row![
+                back_btn,
                 rec_rect_btn,
                 rec_win_btn,
                 rec_full_btn,
                 audio_btn,
                 mic_btn,
                 start_rec_btn,
+                cancel_btn,
             ]
             .spacing(6)
-            .align_y(Alignment::Center);
+            .align_y(Alignment::Center)
+        } else {
+            let rect_btn = pill_icon_button(
+                icons::ICON_RECT,
+                "Retângulo",
+                self.mode == CaptureMode::Rect,
+                palette,
+                OverlayMessage::SelectMode(CaptureMode::Rect),
+            );
+            let free_btn = pill_icon_button(
+                icons::ICON_FREEFORM,
+                "Livre",
+                self.mode == CaptureMode::Freeform,
+                palette,
+                OverlayMessage::SelectMode(CaptureMode::Freeform),
+            );
+            let window_btn = pill_icon_button(
+                icons::ICON_WINDOW,
+                "Janela",
+                self.mode == CaptureMode::Window,
+                palette,
+                OverlayMessage::SelectMode(CaptureMode::Window),
+            );
+            let full_btn = pill_icon_button(
+                icons::ICON_FULLSCREEN,
+                "Fullscreen",
+                self.mode == CaptureMode::Fullscreen,
+                palette,
+                OverlayMessage::ConfirmFullscreen,
+            );
+            let record_btn = pill_icon_button(
+                icons::ICON_RECORD,
+                "Gravar tela",
+                false,
+                palette,
+                OverlayMessage::SelectMode(CaptureMode::Record),
+            );
 
-            let hint = match self.record_target {
-                RecordTarget::Fullscreen => {
-                    "Padrão: Fullscreen — clique em Iniciar gravação ou escolha Retângulo / Janela"
-                }
-                RecordTarget::Rect => "Arraste um retângulo na tela para iniciar a gravação",
-                RecordTarget::Window => "Clique na janela desejada para iniciar a gravação",
+            let next_delay = match self.delay_secs {
+                0 => 3,
+                3 => 5,
+                5 => 10,
+                _ => 0,
             };
+            let delay_label = if self.delay_secs == 0 {
+                "Delay: Off".to_string()
+            } else {
+                format!("Delay: {}s", self.delay_secs)
+            };
+            let delay_btn = button(
+                row![
+                    icons::icon(icons::ICON_DELAY, 14.0, palette.fg),
+                    text(delay_label).size(13),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 12])
+            .style(overlay_pill_btn(false, palette))
+            .on_press(OverlayMessage::SetDelay(next_delay));
 
-            col = col
-                .push(level2)
-                .push(text(hint).size(12).color(Color::from_rgb8(82, 82, 92)));
-        }
+            row![rect_btn, free_btn, window_btn, full_btn, record_btn, delay_btn, cancel_btn]
+                .spacing(6)
+                .align_y(Alignment::Center)
+        };
 
-        Container::new(col)
-            .padding([8, 12])
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgba8(
-                    243, 243, 246, 0.96,
-                ))),
+        Container::new(Column::new().push(bar))
+            .padding([6, 10])
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(palette.pill_bg)),
                 border: iced::Border {
-                    color: Color::from_rgba8(210, 210, 216, 0.9),
+                    color: palette.pill_border,
                     width: 1.0,
-                    radius: 8.0.into(),
+                    radius: 10.0.into(),
                 },
                 ..Default::default()
             })
@@ -584,11 +614,54 @@ impl OverlayState {
     }
 }
 
+/// Paleta de cores adaptável ao tema claro ou escuro do sistema para a pílula flutuante do overlay.
+/// Armazena: `pill_bg`, `pill_border`, `fg`, `fg_disabled`, `btn_hover`, `btn_pressed`, `accent` | Principais métodos: `from_dark`
+#[derive(Debug, Clone, Copy)]
+struct OverlayPalette {
+    pill_bg: Color,
+    pill_border: Color,
+    fg: Color,
+    fg_disabled: Color,
+    btn_hover: Color,
+    btn_pressed: Color,
+    accent: Color,
+}
+
+impl OverlayPalette {
+    /// Retorna a paleta Adwaita escura ou clara para a barra superior do overlay conforme `dark`.
+    /// Input: `dark` (`bool`) | Output: instância de `OverlayPalette`
+    fn from_dark(dark: bool) -> Self {
+        if dark {
+            Self {
+                pill_bg: Color::from_rgba8(42, 42, 46, 0.96),
+                pill_border: Color::from_rgba8(72, 72, 80, 0.95),
+                fg: Color::from_rgb8(240, 240, 244),
+                fg_disabled: Color::from_rgb8(130, 130, 140),
+                btn_hover: Color::from_rgb8(64, 64, 70),
+                btn_pressed: Color::from_rgb8(78, 78, 86),
+                accent: Color::from_rgb8(53, 132, 228),
+            }
+        } else {
+            Self {
+                pill_bg: Color::from_rgba8(246, 245, 244, 0.96),
+                pill_border: Color::from_rgba8(205, 203, 200, 0.92),
+                fg: Color::from_rgb8(36, 36, 38),
+                fg_disabled: Color::from_rgb8(150, 150, 160),
+                btn_hover: Color::from_rgb8(228, 228, 232),
+                btn_pressed: Color::from_rgb8(214, 214, 220),
+                accent: Color::from_rgb8(53, 132, 228),
+            }
+        }
+    }
+}
+
+/// Define o estilo visual vermelho de destaque do botão de ação `Iniciar gravação`.
+/// Input: `_theme` (`&iced::Theme`), `status` (`button::Status`) | Output: `button::Style`
 fn record_action_btn(_theme: &iced::Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered => Color::from_rgb8(185, 28, 28),
-        button::Status::Pressed => Color::from_rgb8(153, 27, 27),
-        _ => Color::from_rgb8(220, 38, 38),
+        button::Status::Hovered => Color::from_rgb8(192, 28, 40),
+        button::Status::Pressed => Color::from_rgb8(165, 29, 45),
+        _ => Color::from_rgb8(224, 27, 36),
     };
     button::Style {
         background: Some(iced::Background::Color(bg)),
@@ -601,23 +674,28 @@ fn record_action_btn(_theme: &iced::Theme, status: button::Status) -> button::St
     }
 }
 
-fn overlay_pill_btn(active: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style + Copy {
+/// Retorna o fechamento de estilo padrão para os botões tipo pílula da barra do overlay.
+/// Input: `active` (`bool`), `palette` (`OverlayPalette`) | Output: função de estilização para `iced::widget::button`
+fn overlay_pill_btn(
+    active: bool,
+    palette: OverlayPalette,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style + Copy {
     move |_theme, status| {
         let bg = if active {
-            Color::from_rgb8(0, 103, 192)
+            palette.accent
         } else {
             match status {
-                button::Status::Hovered => Color::from_rgb8(228, 228, 234),
-                button::Status::Pressed => Color::from_rgb8(214, 214, 222),
+                button::Status::Hovered => palette.btn_hover,
+                button::Status::Pressed => palette.btn_pressed,
                 _ => Color::TRANSPARENT,
             }
         };
         let fg = if active {
             Color::WHITE
         } else if matches!(status, button::Status::Disabled) {
-            Color::from_rgb8(150, 150, 160)
+            palette.fg_disabled
         } else {
-            Color::from_rgb8(26, 26, 28)
+            palette.fg
         };
         button::Style {
             background: Some(iced::Background::Color(bg)),
@@ -631,17 +709,16 @@ fn overlay_pill_btn(active: bool) -> impl Fn(&iced::Theme, button::Status) -> bu
     }
 }
 
+/// Constrói um botão em pílula contendo ícone SVG vetorial e rótulo de texto lado a lado.
+/// Input: `svg_bytes` (`&'static [u8]`), `label` (`&'a str`), `active` (`bool`), `palette` (`OverlayPalette`), `msg` (`OverlayMessage`) | Output: `button::Button<'a, OverlayMessage>`
 fn pill_icon_button<'a>(
     svg_bytes: &'static [u8],
     label: &'a str,
     active: bool,
+    palette: OverlayPalette,
     msg: OverlayMessage,
 ) -> button::Button<'a, OverlayMessage> {
-    let icon_color = if active {
-        Color::WHITE
-    } else {
-        Color::from_rgb8(26, 26, 28)
-    };
+    let icon_color = if active { Color::WHITE } else { palette.fg };
     button(
         row![
             icons::icon(svg_bytes, 14.0, icon_color),
@@ -651,10 +728,12 @@ fn pill_icon_button<'a>(
         .align_y(Alignment::Center),
     )
     .padding([6, 12])
-    .style(overlay_pill_btn(active))
+    .style(overlay_pill_btn(active, palette))
     .on_press(msg)
 }
 
+/// Programa `iced::widget::canvas` responsável por desenhar a seleção e traduzir coordenadas lógicas do monitor para pixels da imagem.
+/// Armazena: `state`, `origin_x`, `origin_y`, `logical_w`, `logical_h` | Principais métodos: `to_image_point`, `to_canvas_point`, `update`, `draw`
 struct OverlayCanvas<'a> {
     state: &'a OverlayState,
     origin_x: f32,
@@ -664,6 +743,8 @@ struct OverlayCanvas<'a> {
 }
 
 impl<'a> OverlayCanvas<'a> {
+    /// Converte uma posição local do canvas no monitor para coordenadas em pixels da imagem capturada.
+    /// Input: `&self`, `bounds` (`Rectangle`), `pos` (`IcedPoint`) | Output: `Point` no espaço da imagem
     fn to_image_point(&self, bounds: Rectangle, pos: IcedPoint) -> Point {
         let scale_x = if bounds.width > 0.0 {
             self.logical_w / bounds.width
@@ -683,6 +764,8 @@ impl<'a> OverlayCanvas<'a> {
         )
     }
 
+    /// Converte coordenadas em pixels da imagem para a posição correspondente dentro dos limites do canvas.
+    /// Input: `&self`, `bounds` (`Rectangle`), `pt` (`Point`) | Output: `IcedPoint` no canvas
     fn to_canvas_point(&self, bounds: Rectangle, pt: Point) -> IcedPoint {
         let img_scale_x = self.state.captured.width as f32 / self.logical_w.max(1.0);
         let img_scale_y = self.state.captured.height as f32 / self.logical_h.max(1.0);
@@ -697,6 +780,8 @@ impl<'a> OverlayCanvas<'a> {
 impl<'a> canvas::Program<OverlayMessage> for OverlayCanvas<'a> {
     type State = bool; // true while pointer button is held
 
+    /// Intercepta eventos de clique, arraste e soltura do mouse no canvas convertendo-os em `OverlayMessage`.
+    /// Input: `&self`, `is_dragging` (`&mut bool`), `event` (`canvas::Event`), `bounds` (`Rectangle`), `cursor` (`mouse::Cursor`) | Output: `(event::Status, Option<OverlayMessage>)`
     fn update(
         &self,
         is_dragging: &mut Self::State,
@@ -745,6 +830,8 @@ impl<'a> canvas::Program<OverlayMessage> for OverlayCanvas<'a> {
         }
     }
 
+    /// Desenha o escurecimento de fundo, destaque da seleção ativa (retângulo, laço livre ou janela) e dimensões no canvas.
+    /// Input: `&self`, `_state` (`&bool`), `renderer` (`&iced::Renderer`), `_theme` (`&iced::Theme`), `bounds` (`Rectangle`), `_cursor` (`mouse::Cursor`) | Output: `Vec<Geometry>`
     fn draw(
         &self,
         _state: &Self::State,
@@ -868,8 +955,8 @@ impl<'a> canvas::Program<OverlayMessage> for OverlayCanvas<'a> {
     }
 }
 
-/// Crops `captured` to `rect` and, if `lasso` is provided, masks pixels outside the polygon
-/// to transparent (`alpha = 0`).
+/// Recorta `captured` para `rect` e, se `lasso` for fornecido, aplica máscara poligonal tornando transparente (`alpha = 0`) o exterior.
+/// Input: `captured` (`&CapturedImage`), `rect` (`Rect`), `lasso` (`Option<&[Point]>`) | Output: `Result<(Vec<u8>, u32, u32), String>` com RGBA recortado e dimensões
 pub fn crop_captured_selection(
     captured: &CapturedImage,
     rect: Rect,
@@ -924,12 +1011,16 @@ pub fn crop_captured_selection(
     Ok((out, w, h))
 }
 
+/// Calcula o quadrado da distância euclidiana entre dois pontos para amostragem do laço livre.
+/// Input: `a` (`Point`), `b` (`Point`) | Output: distância ao quadrado (`f32`)
 fn dist_sq(a: Point, b: Point) -> f32 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
     dx * dx + dy * dy
 }
 
+/// Calcula o retângulo envolvente mínimo (`bounding box`) que contém todos os vértices do polígono.
+/// Input: `points` (`&[Point]`) | Output: `Rect` envolvente
 fn bounding_box(points: &[Point]) -> Rect {
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
@@ -1032,5 +1123,29 @@ mod tests {
                 ..
             })
         ));
+
+        // Back button returns from Level 2 to Level 1 Rect mode.
+        assert!(st.update(OverlayMessage::BackToLevel1).is_none());
+        assert_eq!(st.mode, CaptureMode::Rect);
+    }
+
+    #[test]
+    fn overlay_palette_adapts_to_dark_and_light_theme() {
+        let dark = OverlayPalette::from_dark(true);
+        let light = OverlayPalette::from_dark(false);
+        assert!(dark.pill_bg.r < 0.25);
+        assert!(light.pill_bg.r > 0.90);
+        assert!(dark.fg.r > 0.90);
+        assert!(light.fg.r < 0.25);
+
+        let captured = CapturedImage {
+            rgba: vec![0u8; 4 * 4 * 4],
+            width: 4,
+            height: 4,
+            outputs: vec![],
+        };
+        let st =
+            OverlayState::new(captured, CaptureMode::Rect, 0, false, vec![]).with_dark_theme(true);
+        assert!(st.dark_theme);
     }
 }

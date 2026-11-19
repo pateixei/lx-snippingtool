@@ -1,4 +1,7 @@
-//! Bounded local PNG snip history store with strict directory/file permissions.
+//! Módulo: `storage`
+//! Objetivos: Gerenciar o armazenamento local limitado de capturas PNG e tokens do portal `ScreenCast` com permissões restritas (`0700`/`0600`).
+//! Principais itens: `SnipEntry`, `StorageError`, `SnipStore` e `TokenStore`.
+//! Última alteração: 2026-11-19
 
 use std::cmp::Ordering;
 use std::fs;
@@ -12,29 +15,32 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Metadata for a stored PNG snip.
+/// Representa os metadados de uma captura PNG armazenada no histórico local.
+/// Armazena: `path`, `created_at` e `byte_size` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnipEntry {
-    /// Full path to the PNG file.
+    /// Caminho completo do arquivo PNG.
     pub path: PathBuf,
-    /// Last modification timestamp used for history ordering and pruning.
+    /// Data de modificação usada para ordenar e podar o histórico.
     pub created_at: SystemTime,
-    /// File size in bytes.
+    /// Tamanho do arquivo em bytes.
     pub byte_size: u64,
 }
 
-/// Errors that can occur in [`SnipStore`].
+/// Enumera erros retornados pelas operações de armazenamento de `SnipStore` e `TokenStore`.
+/// Armazena: variantes `NoDataDir` e `Io` | Principais métodos: `Display`, `Error`.
 #[derive(Debug, Error)]
 pub enum StorageError {
-    /// Failed to resolve the XDG data directory.
+    /// Falha ao localizar o diretório XDG de dados da aplicação.
     #[error("unable to determine XDG data directory")]
     NoDataDir,
-    /// Filesystem I/O failure.
+    /// Erro de sistema de arquivos durante leitura ou escrita.
     #[error("storage I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Bounded local PNG history store under `$XDG_DATA_HOME/lx-snippingtool/snips/`.
+/// Repositório local limitado de capturas PNG com poda automática dos itens mais antigos.
+/// Armazena: diretório base `dir` e limite `max_items` | Principais métodos: `new_default`, `save_png`, `list`, `prune`, `delete`.
 #[derive(Debug, Clone)]
 pub struct SnipStore {
     dir: PathBuf,
@@ -42,14 +48,16 @@ pub struct SnipStore {
 }
 
 impl SnipStore {
-    /// Creates a [`SnipStore`] rooted at `$XDG_DATA_HOME/lx-snippingtool/snips/`.
+    /// Cria um `SnipStore` no diretório padrão XDG (`$XDG_DATA_HOME/lx-snippingtool/snips/`).
+    /// Input: limite `max_items` | Output: `Result<SnipStore, StorageError>`.
     pub fn new_default(max_items: usize) -> Result<Self, StorageError> {
         let dirs = ProjectDirs::from("io.github", "lx_snippingtool", "lx-snippingtool")
             .ok_or(StorageError::NoDataDir)?;
         Ok(Self::new(dirs.data_dir().join("snips"), max_items))
     }
 
-    /// Creates a [`SnipStore`] at an explicit directory path.
+    /// Cria um `SnipStore` apontando para um diretório explícito.
+    /// Input: diretório `dir` e limite `max_items` | Output: instância de `SnipStore`.
     pub fn new(dir: impl Into<PathBuf>, max_items: usize) -> Self {
         Self {
             dir: dir.into(),
@@ -57,25 +65,28 @@ impl SnipStore {
         }
     }
 
-    /// Returns the snips directory path.
+    /// Retorna o caminho do diretório onde os PNGs são armazenados.
+    /// Input: `&self` | Output: referência `&Path` ao diretório.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// Returns the maximum number of retained snips.
+    /// Retorna o número máximo de arquivos retidos pelo repositório.
+    /// Input: `&self` | Output: valor `usize` configurado.
     pub fn max_items(&self) -> usize {
         self.max_items
     }
 
-    /// Ensures the snips directory exists and enforces `0700` permissions.
+    /// Garante que o diretório de capturas exista com permissão restrita `0700`.
+    /// Input: `&self` | Output: `Result<(), StorageError>`.
     pub fn ensure_dir(&self) -> Result<(), StorageError> {
         fs::create_dir_all(&self.dir)?;
         fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 
-    /// Saves `png_bytes` as `<unix_ms>_<uuid>.png` with `0600` permissions and prunes
-    /// oldest entries if the store exceeds `max_items`.
+    /// Salva bytes PNG com permissão `0600` e remove arquivos excedentes além de `max_items`.
+    /// Input: `&self` e slice `png_bytes` | Output: `Result<PathBuf, StorageError>` com o caminho criado.
     pub fn save_png(&self, png_bytes: &[u8]) -> Result<PathBuf, StorageError> {
         self.ensure_dir()?;
 
@@ -100,7 +111,8 @@ impl SnipStore {
         Ok(dest_path)
     }
 
-    /// Lists stored `.png` snips sorted newest-first by mtime (with filename tiebreaker).
+    /// Lista todos os arquivos `.png` ordenados do mais recente ao mais antigo.
+    /// Input: `&self` | Output: `Result<Vec<SnipEntry>, StorageError>`.
     pub fn list(&self) -> Result<Vec<SnipEntry>, StorageError> {
         let read_dir = match fs::read_dir(&self.dir) {
             Ok(rd) => rd,
@@ -135,7 +147,8 @@ impl SnipStore {
         Ok(entries)
     }
 
-    /// Removes oldest snips beyond `max_items`, returning the number of files deleted.
+    /// Remove capturas antigas que excedem `max_items` e informa quantas foram apagadas.
+    /// Input: `&self` | Output: `Result<usize, StorageError>` com total removido.
     pub fn prune(&self) -> Result<usize, StorageError> {
         let entries = self.list()?;
         if entries.len() <= self.max_items {
@@ -153,23 +166,27 @@ impl SnipStore {
         Ok(removed)
     }
 
-    /// Deletes a specific snip file from the store.
+    /// Exclui do disco um arquivo específico pertencente ao histórico.
+    /// Input: `&self` e `path` do arquivo | Output: `Result<(), StorageError>`.
     pub fn delete(&self, path: &Path) -> Result<(), StorageError> {
         fs::remove_file(path)?;
         Ok(())
     }
 }
 
-/// Persistent `xdg-desktop-portal` `ScreenCast` `restore_token` store (`tokens.json`).
+/// Armazena o token persistente do portal `ScreenCast` (`restore_token`) em `tokens.json`.
+/// Armazena: `schema_version` e `screencast_restore_token` | Principais métodos: `default_path`, `load_default`, `save_default`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenStore {
-    /// Schema version for forward/backward compatibility.
+    /// Versão do esquema para compatibilidade futura.
     pub schema_version: u32,
-    /// Saved `ScreenCast` `restore_token` (`persist_mode = 2`).
+    /// Token salvo do portal `ScreenCast` (`persist_mode = 2`).
     pub screencast_restore_token: Option<String>,
 }
 
 impl Default for TokenStore {
+    /// Constrói um `TokenStore` vazio na versão de esquema 1.
+    /// Input: nenhum | Output: `TokenStore` inicial padrão.
     fn default() -> Self {
         Self {
             schema_version: 1,
@@ -179,13 +196,15 @@ impl Default for TokenStore {
 }
 
 impl TokenStore {
-    /// Default `tokens.json` path under `$XDG_DATA_HOME/lx-snippingtool/tokens.json`.
+    /// Resolve o caminho padrão de `tokens.json` no diretório XDG de dados.
+    /// Input: nenhum | Output: `Result<PathBuf, StorageError>`.
     pub fn default_path() -> Result<PathBuf, StorageError> {
         let proj = ProjectDirs::from("", "", "lx-snippingtool").ok_or(StorageError::NoDataDir)?;
         Ok(proj.data_dir().join("tokens.json"))
     }
 
-    /// Loads `tokens.json` from the default path (returning `Default` if missing or corrupt).
+    /// Carrega `tokens.json` do caminho padrão ou devolve `Default` se ausente/inválido.
+    /// Input: nenhum | Output: instância carregada ou padrão de `TokenStore`.
     pub fn load_default() -> Self {
         let Ok(path) = Self::default_path() else {
             return Self::default();
@@ -199,7 +218,8 @@ impl TokenStore {
         }
     }
 
-    /// Saves `tokens.json` atomically with `0700` dir and `0600` file permissions.
+    /// Persiste `tokens.json` atomicamente com permissões `0700` no diretório e `0600` no arquivo.
+    /// Input: `&self` | Output: `Result<(), StorageError>`.
     pub fn save_default(&self) -> Result<(), StorageError> {
         let path = Self::default_path()?;
         let parent = path.parent().ok_or(StorageError::NoDataDir)?;

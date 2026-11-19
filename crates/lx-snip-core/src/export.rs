@@ -1,4 +1,7 @@
-//! Destructive rasterization and metadata-free image export.
+//! Módulo: `export`
+//! Objetivos: Rasterizar anotações, aplicar redações destrutivas e exportar PNG/JPEG sem metadados EXIF/texto.
+//! Principais itens: `ExportFormat`, `ExportError`, `render_to_rgba`, `render_and_export` e `encode_rgba`.
+//! Última alteração: 2026-11-19
 
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
@@ -11,49 +14,51 @@ use tiny_skia::{
 
 use crate::scene::{AnnotationOp, AnnotationScene, Color, Point, Rect, ShapeKind};
 
-/// Default JPEG export quality (`1..=100`).
+/// Qualidade padrão de exportação JPEG (`1..=100`).
 pub const DEFAULT_JPEG_QUALITY: u8 = 90;
 
-/// Supported output image formats.
+/// Formatos de saída suportados na exportação de imagens.
+/// Armazena: variantes `Png` e `Jpeg { quality }` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExportFormat {
-    /// Lossless PNG without any metadata (`eXIf`, `tEXt`, `zTXt`, `iTXt`) chunks.
+    /// PNG sem perdas e livre de chunks de metadados (`eXIf`, `tEXt`, `zTXt`, `iTXt`).
     #[default]
     Png,
-    /// Lossy JPEG with transparent pixels composited onto opaque white.
+    /// JPEG com composição prévia de transparência sobre fundo branco sólido.
     Jpeg {
-        /// Encoder quality in `1..=100` (clamped if outside range).
+        /// Qualidade do encoder entre `1` e `100`.
         quality: u8,
     },
 }
 
-/// Errors produced during scene rasterization or encoding.
+/// Enumera erros ocorridos durante a rasterização ou codificação de uma cena anotada.
+/// Armazena: variantes de dimensão inválida, tamanho de buffer, recorte vazio e falha de encoder | Principais métodos: `Display`, `Error`.
 #[derive(Debug, Error)]
 pub enum ExportError {
-    /// Base image dimensions were zero.
+    /// Dimensões da imagem base iguais a zero ou inválidas.
     #[error("invalid image dimensions: width and height must be positive")]
     InvalidDimensions,
-    /// Base RGBA buffer length did not match `width * height * 4`.
+    /// Comprimento do buffer RGBA difere de `width * height * 4`.
     #[error("RGBA buffer size mismatch: expected {expected} bytes, got {actual}")]
     BufferSizeMismatch {
-        /// Expected byte length (`width * height * 4`).
+        /// Tamanho esperado em bytes.
         expected: usize,
-        /// Actual byte length provided.
+        /// Tamanho efetivo recebido.
         actual: usize,
     },
-    /// Crop rectangle produced zero width or height after clamping.
+    /// Retângulo de recorte resultou em largura ou altura nula.
     #[error("crop rectangle is empty after clamping to image bounds")]
     EmptyCrop,
-    /// `tiny-skia` failed to allocate a pixmap for the target dimensions.
+    /// Falha ao alocar o pixmap do `tiny-skia`.
     #[error("failed to allocate rasterization pixmap")]
     PixmapAllocationFailed,
-    /// Image encoder failed.
+    /// Erro retornado pelo codificador PNG/JPEG.
     #[error("failed to encode output image: {0}")]
     Encode(String),
 }
 
-/// Rasterizes `scene` onto `base_rgba` (`width` x `height` straight RGBA8) and returns
-/// the cropped straight RGBA8 buffer along with its output `(width, height)`.
+/// Rasteriza todas as operações de `scene` sobre `base_rgba` aplicando recorte e redação destrutiva.
+/// Input: `base_rgba`, `width`, `height` e `scene` | Output: `Result<(Vec<u8>, u32, u32), ExportError>` em RGBA8 reto.
 pub fn render_to_rgba(
     base_rgba: &[u8],
     width: u32,
@@ -105,8 +110,8 @@ pub fn render_to_rgba(
     Ok((out_rgba, crop_w, crop_h))
 }
 
-/// Rasterizes `scene` onto `base_rgba` and encodes the result in `format` without EXIF
-/// or PNG text chunks.
+/// Rasteriza `scene` sobre `base_rgba` e codifica o resultado em PNG ou JPEG sem metadados.
+/// Input: `base_rgba`, `width`, `height`, `scene` e `format` | Output: `Result<Vec<u8>, ExportError>` com bytes codificados.
 pub fn render_and_export(
     base_rgba: &[u8],
     width: u32,
@@ -118,7 +123,8 @@ pub fn render_and_export(
     encode_rgba(&rgba, out_w, out_h, format)
 }
 
-/// Encodes straight RGBA8 pixels into PNG or JPEG without metadata.
+/// Codifica pixels RGBA8 retos para o formato PNG ou JPEG sem chunks de metadados.
+/// Input: slice `rgba`, `width`, `height` e `format` | Output: `Result<Vec<u8>, ExportError>` codificado.
 pub fn encode_rgba(
     rgba: &[u8],
     width: u32,
@@ -144,6 +150,8 @@ pub fn encode_rgba(
     Ok(out)
 }
 
+/// Converte o retângulo opcional de recorte para coordenadas inteiras limitadas às dimensões da imagem.
+/// Input: `crop_rect`, `width` e `height` | Output: `Result<(u32, u32, u32, u32), ExportError>` `(x, y, w, h)`.
 fn resolve_crop(
     crop_rect: Option<Rect>,
     width: u32,
@@ -167,6 +175,8 @@ fn resolve_crop(
     Ok((x0, y0, cw, ch))
 }
 
+/// Copia a sub-região recortada de RGBA8 reto para um `Pixmap` pré-multiplicado do `tiny-skia`.
+/// Input: `base_rgba`, `base_width`, região (`crop_x`, `crop_y`, `crop_w`, `crop_h`) e `pixmap` | Output: `pixmap` preenchido.
 fn copy_cropped_rgba_to_pixmap(
     base_rgba: &[u8],
     base_width: u32,
@@ -199,6 +209,8 @@ fn copy_cropped_rgba_to_pixmap(
     }
 }
 
+/// Compõe pixels RGBA sobre fundo branco opaco gerando buffer RGB8 para exportação JPEG.
+/// Input: slice `rgba` | Output: `Vec<u8>` com 3 bytes por pixel (RGB8).
 fn composite_rgba_onto_white(rgba: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity((rgba.len() / 4) * 3);
     for px in rgba.as_chunks::<4>().0 {
@@ -214,6 +226,8 @@ fn composite_rgba_onto_white(rgba: &[u8]) -> Vec<u8> {
     rgb
 }
 
+/// Desenha uma única operação (`Pen`, `Highlighter`, `Shape` ou `RedactBox`) sobre o `Pixmap`.
+/// Input: `pixmap` destino, operação `op` e matriz `transform` | Output: desenha diretamente no `pixmap`.
 fn draw_op(pixmap: &mut Pixmap, op: &AnnotationOp, transform: Transform) {
     match op {
         AnnotationOp::Pen {
@@ -255,6 +269,8 @@ fn draw_op(pixmap: &mut Pixmap, op: &AnnotationOp, transform: Transform) {
     }
 }
 
+/// Renderiza um traço livre poligonal suavizado no `Pixmap`.
+/// Input: `pixmap`, vértices `points`, `color`, `width` e `transform` | Output: desenha o traço no `pixmap`.
 fn draw_polyline(
     pixmap: &mut Pixmap,
     points: &[Point],
@@ -301,6 +317,8 @@ fn draw_polyline(
     }
 }
 
+/// Renderiza uma forma geométrica (retângulo, elipse, linha ou seta) no `Pixmap`.
+/// Input: `pixmap`, `kind`, pontos `start`/`end`, `color`, `width` e `transform` | Output: desenha a forma no `pixmap`.
 fn draw_shape(
     pixmap: &mut Pixmap,
     kind: ShapeKind,

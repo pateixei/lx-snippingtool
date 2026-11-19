@@ -1,5 +1,7 @@
-//! Post-copy desktop notifications via `ashpd::desktop::notification` that spawn
-//! `lx-snippingtool --editor <snip_path>` when clicked.
+//! Módulo: `notification`
+//! Objetivos: Enviar notificações desktop pós-cópia via `ashpd` e abrir o editor ao clicar na ação "Edit".
+//! Principais itens: `notify_and_listen_for_edit` e `spawn_editor`.
+//! Última alteração: 2026-11-19
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,8 +10,8 @@ use ashpd::desktop::notification::{Button, Notification, NotificationProxy};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-/// Sends a desktop notification for a copied snip and listens for the `"edit"` action
-/// to spawn `lx-snippingtool --editor <snip_path>`.
+/// Envia uma notificação de imagem copiada e aguarda o clique na ação "Edit" para abrir o editor.
+/// Input: `snip_path` do PNG salvo localmente | Output: futuro assíncrono sem retorno (efeito colateral D-Bus).
 pub async fn notify_and_listen_for_edit(snip_path: PathBuf) {
     let notif_id = format!("lx-snip-{}", Uuid::new_v4());
     let proxy = match NotificationProxy::new().await {
@@ -49,6 +51,8 @@ pub async fn notify_and_listen_for_edit(snip_path: PathBuf) {
     }
 }
 
+/// Inicia uma nova instância do executável com `--editor <snip_path>` de forma destacada.
+/// Input: `snip_path` do arquivo PNG | Output: nenhum (gera processo filho desacoplado).
 fn spawn_editor(snip_path: &Path) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,

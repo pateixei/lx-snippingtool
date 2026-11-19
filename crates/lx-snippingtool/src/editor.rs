@@ -1,11 +1,13 @@
-//! Annotation editor window backed by `lx_snip_core::scene::AnnotationScene`
-//! and `lx_snip_core::export::render_and_export`.
+//! Módulo: `editor`
+//! Objetivos: Implementar a janela do editor de anotações de capturas de tela no estilo Windows 11 Snipping Tool (temas Claro/Escuro), suportando desenho livre, marca-texto, borracha, formas geométricas, tarja preta, recorte, desfazer/refazer, cópia e exportação PNG/JPEG via portal.
+//! Principais itens: `UiTheme`, `EditorTool`, `EditorMessage`, `EditorAction`, `EditorState`, `EditorCanvas`, `save_as_via_portal`
+//! Última alteração: 2026-11-19
 
 use std::path::PathBuf;
 
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, LineCap, LineJoin, Path, Stroke};
-use iced::widget::{button, container, mouse_area, row, text, Column};
+use iced::widget::{button, container, row, text, Column};
 use iced::{event, Alignment, Color, Element, Length, Point as IcedPoint, Rectangle, Size};
 use lx_snip_core::export::{render_and_export, ExportFormat, DEFAULT_JPEG_QUALITY};
 use lx_snip_core::scene::{
@@ -14,13 +16,18 @@ use lx_snip_core::scene::{
 
 use crate::icons;
 
-/// Visual theme for the editor (Windows 11 Fluent Light / Dark).
+/// Esquema visual Fluent do editor alternando entre modo claro e escuro.
+/// Armazena: variantes `Light` e `Dark` | Principais métodos: `from_dark`, `palette`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiTheme {
+    /// Tema claro padrão estilo Windows 11 Fluent Light.
     Light,
+    /// Tema escuro estilo Windows 11 Fluent Dark.
     Dark,
 }
 
+/// Paleta concreta de cores de fundo, borda, texto e realce usada pelos widgets do editor.
+/// Armazena: `header_bg`, `workspace_bg`, `card_bg`, `card_hover`, `card_border`, `pill_bg`, `text`, `text_muted`, `accent`, `accent_hover`, `active_bg` | Principais métodos: nenhum (estrutura de paleta)
 #[derive(Debug, Clone, Copy)]
 struct ThemePalette {
     header_bg: Color,
@@ -37,6 +44,18 @@ struct ThemePalette {
 }
 
 impl UiTheme {
+    /// Converte a preferência booleana de modo escuro do sistema em `UiTheme`.
+    /// Input: `dark` (`bool`) | Output: `UiTheme::Dark` ou `UiTheme::Light`
+    pub const fn from_dark(dark: bool) -> Self {
+        if dark {
+            Self::Dark
+        } else {
+            Self::Light
+        }
+    }
+
+    /// Retorna a paleta de cores `ThemePalette` correspondente à variante de tema ativa.
+    /// Input: `self` | Output: instância de `ThemePalette`
     fn palette(self) -> ThemePalette {
         match self {
             UiTheme::Light => ThemePalette {
@@ -69,7 +88,8 @@ impl UiTheme {
     }
 }
 
-/// Active drawing/editing tool in the annotation editor.
+/// Ferramenta de desenho ou edição atualmente selecionada na barra do editor.
+/// Armazena: variantes `Pen`, `Highlighter`, `Eraser`, `Shape`, `Redact` e `Crop` | Principais métodos: nenhum (enumeração de ferramentas)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorTool {
     /// Freehand opaque pen.
@@ -86,7 +106,8 @@ pub enum EditorTool {
     Crop,
 }
 
-/// Messages emitted by the annotation editor.
+/// Mensagens de interação e eventos assíncronos processados pelo editor de anotações.
+/// Armazena: eventos de seleção de ferramenta/cor/espessura, ponteiro, desfazer/refazer, recorte, exportação, histórico, tema e controles de janela | Principais métodos: nenhum (tipo de mensagem)
 #[derive(Debug, Clone)]
 pub enum EditorMessage {
     /// Switch active annotation tool.
@@ -119,17 +140,10 @@ pub enum EditorMessage {
     OpenHistory,
     /// Toggle between Windows 11 Light and Dark themes.
     ToggleTheme,
-    /// Minimize the editor window.
-    MinimizeWindow,
-    /// Toggle maximize on the editor window.
-    ToggleMaximizeWindow,
-    /// Start dragging the editor window from the titlebar.
-    DragWindow,
-    /// Close the editor window.
-    CloseWindow,
 }
 
-/// Outcome returned by [`EditorState::update`] when the editor triggers an external action.
+/// Ação externa solicitada ao controlador principal por `EditorState::update`.
+/// Armazena: variantes `CopyAndExit`, `RunSaveAs`, `NewCapture` e `OpenHistory` | Principais métodos: nenhum (enumeração de saída)
 #[derive(Debug, Clone)]
 pub enum EditorAction {
     /// Exported PNG bytes ready to be saved to `SnipStore` and handed to `ClipboardBackend`.
@@ -149,17 +163,10 @@ pub enum EditorAction {
     NewCapture,
     /// Open Snip History window.
     OpenHistory,
-    /// Minimize the editor window.
-    Minimize,
-    /// Toggle maximize on the editor window.
-    ToggleMaximize,
-    /// Drag the editor window.
-    DragWindow,
-    /// Close the editor window.
-    Close,
 }
 
-/// State of the annotation editor window.
+/// Estado completo da janela do editor de anotações, cena vetorial e tema ativo.
+/// Armazena: `base_rgba`, `width`, `height`, `bg_handle`, `scene`, `active_tool`, `active_color`, `stroke_width`, `in_progress_points`, `drag_start`, `drag_current`, `status_text`, `theme` | Principais métodos: `new`, `from_png_file`, `with_theme`, `update`, `view`
 #[derive(Debug, Clone)]
 pub struct EditorState {
     /// Base straight RGBA8 image buffer.
@@ -191,7 +198,8 @@ pub struct EditorState {
 }
 
 impl EditorState {
-    /// Creates a new [`EditorState`] from a straight RGBA8 image.
+    /// Inicializa um novo estado do editor a partir de um buffer de pixels RGBA8 sem compressão.
+    /// Input: `base_rgba` (`Vec<u8>`), `width` (`u32`), `height` (`u32`) | Output: instância de `EditorState`
     pub fn new(base_rgba: Vec<u8>, width: u32, height: u32) -> Self {
         let bg_handle = iced::widget::image::Handle::from_rgba(width, height, base_rgba.clone());
         Self {
@@ -211,7 +219,8 @@ impl EditorState {
         }
     }
 
-    /// Loads an [`EditorState`] from a PNG file on disk.
+    /// Carrega uma imagem PNG do disco e cria um `EditorState` pronto para anotação.
+    /// Input: `path` (`&std::path::Path`) | Output: `Result<EditorState, String>`
     pub fn from_png_file(path: &std::path::Path) -> Result<Self, String> {
         let dyn_img =
             image::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
@@ -220,7 +229,15 @@ impl EditorState {
         Ok(Self::new(rgba_img.into_raw(), w, h))
     }
 
-    /// Updates editor state and optionally returns an [`EditorAction`].
+    /// Define o tema visual inicial (`UiTheme`) do editor e retorna o estado configurado.
+    /// Input: `mut self`, `theme` (`UiTheme`) | Output: `Self` com `self.theme` atualizado
+    pub const fn with_theme(mut self, theme: UiTheme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// Processa uma mensagem da interface do editor atualizando ferramentas/cena e emitindo ação externa opcional.
+    /// Input: `&mut self`, `msg` (`EditorMessage`) | Output: `Option<EditorAction>`
     pub fn update(&mut self, msg: EditorMessage) -> Option<EditorAction> {
         match msg {
             EditorMessage::SelectTool(tool) => {
@@ -390,55 +407,15 @@ impl EditorState {
                 };
                 None
             }
-            EditorMessage::MinimizeWindow => Some(EditorAction::Minimize),
-            EditorMessage::ToggleMaximizeWindow => Some(EditorAction::ToggleMaximize),
-            EditorMessage::DragWindow => Some(EditorAction::DragWindow),
-            EditorMessage::CloseWindow => Some(EditorAction::Close),
         }
     }
 
-    /// Renders the annotation editor UI matching Windows 11 Snipping Tool (Light & Dark themes).
+    /// Constrói a árvore de interface completa do editor com barra de ferramentas, pílula de anotações, canvas central e rodapé sob decorações padrão do sistema.
+    /// Input: `&self` | Output: `Element<'_, EditorMessage>`
     pub fn view(&self) -> Element<'_, EditorMessage> {
         let p = self.theme.palette();
 
-        // Row 0: Windows 11 Integrated Title Bar ("Lx Snipping Tool" + Minimize / Maximize / Close)
-        let title_drag = mouse_area(
-            row![
-                icons::app_icon(18.0),
-                text("Lx Snipping Tool").size(12).color(p.text),
-                iced::widget::Space::with_width(Length::Fill),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .padding([6, 12]),
-        )
-        .on_press(EditorMessage::DragWindow);
-
-        let win_controls = row![
-            button(icons::icon(icons::ICON_MINIMIZE, 12.0, p.text))
-                .padding([7, 14])
-                .style(win11_flat_btn(p, false))
-                .on_press(EditorMessage::MinimizeWindow),
-            button(icons::icon(icons::ICON_MAXIMIZE, 12.0, p.text))
-                .padding([7, 14])
-                .style(win11_flat_btn(p, false))
-                .on_press(EditorMessage::ToggleMaximizeWindow),
-            button(icons::icon(icons::ICON_CLOSE, 12.0, p.text))
-                .padding([7, 14])
-                .style(win11_close_btn(p))
-                .on_press(EditorMessage::CloseWindow),
-        ]
-        .spacing(0)
-        .align_y(Alignment::Center);
-
-        let title_bar = container(row![title_drag, win_controls].align_y(Alignment::Center))
-            .width(Length::Fill)
-            .style(move |_theme| container::Style {
-                background: Some(iced::Background::Color(p.header_bg)),
-                ..Default::default()
-            });
-
-        // Row 1: Windows 11 Header Bar (+ New | Undo Redo | Save Copy History Theme)
+        // Row 1: Action Bar (+ New | Undo Redo | Save Copy | History Theme)
         let new_btn = button(
             row![
                 text("+").size(16).color(p.accent),
@@ -516,7 +493,7 @@ impl EditorState {
                 v_divider(p),
                 undo_btn,
                 redo_btn,
-                iced::widget::Space::with_width(Length::Fill),
+                v_divider(p),
                 save_btn,
                 copy_btn,
                 v_divider(p),
@@ -528,6 +505,7 @@ impl EditorState {
         )
         .width(Length::Fill)
         .padding([6, 14])
+        .center_x(Length::Fill)
         .style(move |_theme| container::Style {
             background: Some(iced::Background::Color(p.header_bg)),
             border: iced::Border {
@@ -701,7 +679,6 @@ impl EditorState {
         });
 
         let col = Column::new()
-            .push(title_bar)
             .push(header_bar)
             .push(sub_bar)
             .push(workspace)
@@ -714,8 +691,8 @@ impl EditorState {
     }
 }
 
-/// Runs the native `ashpd::desktop::file_chooser` Save As dialog and writes the exported
-/// PNG or JPEG (determined by file extension, defaulting to PNG) to disk.
+/// Abre o diálogo nativo `Salvar Como` do portal XDG e grava a imagem rasterizada em PNG ou JPEG no caminho escolhido.
+/// Input: `base_rgba` (`Vec<u8>`), `width` (`u32`), `height` (`u32`), `scene` (`AnnotationScene`) | Output: `Result<Option<PathBuf>, String>` com caminho salvo ou `None` se cancelado
 pub async fn save_as_via_portal(
     base_rgba: Vec<u8>,
     width: u32,
@@ -764,6 +741,8 @@ pub async fn save_as_via_portal(
     Ok(Some(path))
 }
 
+/// Constrói um divisor vertical fino de 1 px estilizado conforme a paleta do tema.
+/// Input: `p` (`ThemePalette`) | Output: `Element<'static, EditorMessage>`
 fn v_divider(p: ThemePalette) -> Element<'static, EditorMessage> {
     container(iced::widget::Space::with_width(1).height(20))
         .style(move |_theme| container::Style {
@@ -773,6 +752,8 @@ fn v_divider(p: ThemePalette) -> Element<'static, EditorMessage> {
         .into()
 }
 
+/// Retorna o estilo Fluent de destaque com cor de acento para ações primárias do editor.
+/// Input: `p` (`ThemePalette`) | Output: função de estilização para `iced::widget::button`
 fn win11_accent_btn(
     p: ThemePalette,
 ) -> impl Fn(&iced::Theme, button::Status) -> button::Style + Copy {
@@ -793,6 +774,8 @@ fn win11_accent_btn(
     }
 }
 
+/// Retorna o estilo Fluent de cartão com borda sutil para botões secundários da barra.
+/// Input: `p` (`ThemePalette`) | Output: função de estilização para `iced::widget::button`
 fn win11_card_btn(
     p: ThemePalette,
 ) -> impl Fn(&iced::Theme, button::Status) -> button::Style + Copy {
@@ -815,6 +798,8 @@ fn win11_card_btn(
     }
 }
 
+/// Retorna o estilo plano Fluent com estado ativo opcional para botões de ferramenta e utilitários.
+/// Input: `p` (`ThemePalette`), `active` (`bool`) | Output: função de estilização para `iced::widget::button`
 fn win11_flat_btn(
     p: ThemePalette,
     active: bool,
@@ -847,25 +832,8 @@ fn win11_flat_btn(
     }
 }
 
-fn win11_close_btn(
-    p: ThemePalette,
-) -> impl Fn(&iced::Theme, button::Status) -> button::Style + Copy {
-    move |_theme, status| {
-        let (bg, fg) = match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                (Color::from_rgb8(196, 43, 28), Color::WHITE)
-            }
-            _ => (Color::TRANSPARENT, p.text),
-        };
-        button::Style {
-            background: Some(iced::Background::Color(bg)),
-            text_color: fg,
-            border: iced::Border::default(),
-            ..Default::default()
-        }
-    }
-}
-
+/// Cria um botão de ferramenta com ícone SVG que seleciona `tool` ao ser pressionado.
+/// Input: `p` (`ThemePalette`), `svg_bytes` (`&'static [u8]`), `active` (`bool`), `tool` (`EditorTool`) | Output: `button::Button<'static, EditorMessage>`
 fn icon_tool_btn(
     p: ThemePalette,
     svg_bytes: &'static [u8],
@@ -879,6 +847,8 @@ fn icon_tool_btn(
         .on_press(EditorMessage::SelectTool(tool))
 }
 
+/// Cria um seletor circular colorido para alterar a cor do traço ativo no editor.
+/// Input: `p` (`ThemePalette`), `color` (`SceneColor`), `active` (`bool`) | Output: `button::Button<'static, EditorMessage>`
 fn color_swatch(
     p: ThemePalette,
     color: SceneColor,
@@ -919,6 +889,8 @@ fn color_swatch(
         .on_press(EditorMessage::SelectColor(color))
 }
 
+/// Cria um botão compacto de texto que aplica uma espessura de traço predefinida em pixels.
+/// Input: `p` (`ThemePalette`), `label` (`&str`), `width` (`f32`), `active` (`bool`) | Output: `button::Button<'_, EditorMessage>`
 fn width_btn(
     p: ThemePalette,
     label: &str,
@@ -931,11 +903,15 @@ fn width_btn(
         .on_press(EditorMessage::SetStrokeWidth(width))
 }
 
+/// Programa `iced::widget::canvas` responsável por renderizar as anotações sobre a imagem ajustada e capturar o ponteiro.
+/// Armazena: `state` (`&'a EditorState`) | Principais métodos: `fit_rect`, `to_image_point`, `to_canvas_point`, `update`, `draw`
 struct EditorCanvas<'a> {
     state: &'a EditorState,
 }
 
 impl<'a> EditorCanvas<'a> {
+    /// Calcula o retângulo centralizado onde a imagem base cabe mantendo proporção dentro dos limites disponíveis.
+    /// Input: `&self`, `bounds` (`Rectangle`) | Output: `Rectangle` ajustado no canvas
     fn fit_rect(&self, bounds: Rectangle) -> Rectangle {
         let img_w = self.state.width.max(1) as f32;
         let img_h = self.state.height.max(1) as f32;
@@ -953,6 +929,8 @@ impl<'a> EditorCanvas<'a> {
         }
     }
 
+    /// Converte uma posição do ponteiro no canvas para coordenadas limitadas em pixels da imagem base.
+    /// Input: `&self`, `fit` (`Rectangle`), `pos` (`IcedPoint`) | Output: `Point` no espaço da imagem
     fn to_image_point(&self, fit: Rectangle, pos: IcedPoint) -> Point {
         let x = ((pos.x - fit.x) / fit.width.max(1.0)) * (self.state.width as f32);
         let y = ((pos.y - fit.y) / fit.height.max(1.0)) * (self.state.height as f32);
@@ -962,6 +940,8 @@ impl<'a> EditorCanvas<'a> {
         )
     }
 
+    /// Converte um ponto em coordenadas da imagem para a posição correspondente dentro de `fit` no canvas.
+    /// Input: `&self`, `fit` (`Rectangle`), `pt` (`Point`) | Output: `IcedPoint` no canvas
     fn to_canvas_point(&self, fit: Rectangle, pt: Point) -> IcedPoint {
         let sx = fit.width / (self.state.width.max(1) as f32);
         let sy = fit.height / (self.state.height.max(1) as f32);
@@ -972,6 +952,8 @@ impl<'a> EditorCanvas<'a> {
 impl<'a> canvas::Program<EditorMessage> for EditorCanvas<'a> {
     type State = bool;
 
+    /// Captura eventos de clique, arraste e soltura do mouse no canvas convertendo-os em `EditorMessage`.
+    /// Input: `&self`, `is_dragging` (`&mut bool`), `event` (`canvas::Event`), `bounds` (`Rectangle`), `cursor` (`mouse::Cursor`) | Output: `(event::Status, Option<EditorMessage>)`
     fn update(
         &self,
         is_dragging: &mut Self::State,
@@ -1018,6 +1000,8 @@ impl<'a> canvas::Program<EditorMessage> for EditorCanvas<'a> {
         }
     }
 
+    /// Renderiza no `Frame` as operações confirmadas da cena, o traço/forma em andamento e a máscara de recorte.
+    /// Input: `&self`, `_state` (`&bool`), `renderer` (`&iced::Renderer`), `_theme` (`&iced::Theme`), `bounds` (`Rectangle`), `_cursor` (`mouse::Cursor`) | Output: `Vec<Geometry>`
     fn draw(
         &self,
         _state: &Self::State,
@@ -1106,6 +1090,8 @@ impl<'a> canvas::Program<EditorMessage> for EditorCanvas<'a> {
     }
 }
 
+/// Converte uma `SceneColor` com multiplicador de opacidade em `iced::Color`.
+/// Input: `c` (`SceneColor`), `alpha_mul` (`f32`) | Output: `Color` normalizado entre `0.0` e `1.0`
 fn to_iced_color(c: SceneColor, alpha_mul: f32) -> Color {
     Color::from_rgba8(
         c.r,
@@ -1115,10 +1101,14 @@ fn to_iced_color(c: SceneColor, alpha_mul: f32) -> Color {
     )
 }
 
+/// Transforma um ponto de coordenadas de imagem em coordenadas do canvas usando o deslocamento `fit` e fator `scale`.
+/// Input: `fit` (`Rectangle`), `scale` (`f32`), `pt` (`Point`) | Output: `IcedPoint` escalado
 fn to_canvas_pt(fit: Rectangle, scale: f32, pt: Point) -> IcedPoint {
     IcedPoint::new(fit.x + pt.x * scale, fit.y + pt.y * scale)
 }
 
+/// Desenha uma única operação vetorial `AnnotationOp` (caneta, marca-texto, forma ou tarja) sobre o frame do canvas.
+/// Input: `frame` (`&mut Frame`), `fit` (`Rectangle`), `scale` (`f32`), `op` (`&AnnotationOp`) | Output: `()`
 fn draw_scene_op(frame: &mut Frame, fit: Rectangle, scale: f32, op: &AnnotationOp) {
     match op {
         AnnotationOp::Pen {
@@ -1220,6 +1210,8 @@ fn draw_scene_op(frame: &mut Frame, fit: Rectangle, scale: f32, op: &AnnotationO
     }
 }
 
+/// Traça uma polilinha suave (ou círculo quando há apenas um ponto) no frame do canvas para caneta ou marca-texto.
+/// Input: `frame` (`&mut Frame`), `fit` (`Rectangle`), `scale` (`f32`), `points` (`&[Point]`), `color` (`Color`), `width` (`f32`) | Output: `()`
 fn draw_polyline(
     frame: &mut Frame,
     fit: Rectangle,

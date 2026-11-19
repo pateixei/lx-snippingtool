@@ -2740,6 +2740,8 @@ dependencies = [
  "libc",
  "lx-snip-core",
  "pipewire",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tiny-skia",
  "tokio",

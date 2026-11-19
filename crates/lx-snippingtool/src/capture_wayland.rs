@@ -1,8 +1,7 @@
-//! Wayland screen capture backend using `xdg-desktop-portal` `ScreenCast` (`ashpd`),
-//! persistent `restore_token` (`TokenStore`), `pipewire` single-frame grab, and
-//! `wl_output` / `zxdg_output_manager_v1` output geometry enumeration.
-//!
-//! No `Screenshot` fallback is used: PipeWire / `ScreenCast` support is required.
+//! Módulo: `capture_wayland`
+//! Objetivos: Capturar quadros e abrir sessões de gravação em Wayland via portal `ScreenCast` (`ashpd`), `restore_token`, PipeWire e `wl_output`/`xdg-output`, sem fallback `Screenshot`.
+//! Principais itens: `PortalCaptureBackend`, `WaylandSource`, `WaylandScreencastSession`, `open_screencast_session_for`, `query_wayland_outputs`, `trim_transparent_border`
+//! Última alteração: 2026-11-19
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -29,32 +28,42 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zx
 const APP_ID: &str = "io.github.lx_snippingtool.SnippingTool";
 const PIPEWIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Wayland capture backend backed strictly by `org.freedesktop.portal.ScreenCast` + PipeWire.
+/// Backend de captura de tela para Wayland baseado no portal XDG `ScreenCast` e PipeWire.
+/// Armazena: unidade sem estado (unit struct) | Principais métodos: `new`, `supports_window_mode`, `capture_desktop`, `capture_window`
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PortalCaptureBackend;
 
 impl PortalCaptureBackend {
-    /// Creates a new [`PortalCaptureBackend`].
+    /// Cria uma nova instância padrão de `PortalCaptureBackend`.
+    /// Input: nenhum | Output: instância de `PortalCaptureBackend`
     pub const fn new() -> Self {
         Self
     }
 }
 
 impl CaptureBackend for PortalCaptureBackend {
+    /// Informa se a captura de janela dedicada é exposta pelo modo padrão de backend.
+    /// Input: `&self` | Output: `false` (seleção de janela é invocada diretamente por fluxo específico)
     fn supports_window_mode(&self) -> bool {
         // Window mode uses ScreenCast source selection if invoked via `--mode window`.
         false
     }
 
+    /// Captura um quadro estático de monitor/área de trabalho via portal Wayland ScreenCast.
+    /// Input: `&self` | Output: `PlatformFuture<'_, CapturedImage>` com os pixels RGBA capturados
     fn capture_desktop(&self) -> PlatformFuture<'_, CapturedImage> {
         Box::pin(async move { capture_via_screencast(SourceType::Monitor).await })
     }
 
+    /// Captura um quadro estático de uma janela escolhida no seletor do portal Wayland.
+    /// Input: `&self` | Output: `PlatformFuture<'_, CapturedImage>` com os pixels RGBA da janela
     fn capture_window(&self) -> PlatformFuture<'_, CapturedImage> {
         Box::pin(async move { capture_via_screencast(SourceType::Window).await })
     }
 }
 
+/// Registra o aplicativo no `org.freedesktop.host.portal.Registry` via D-Bus para identificação no compositor.
+/// Input: nenhum | Output: `()` (falhas são apenas registradas em log de depuração)
 async fn register_host_app() {
     let Ok(app_id) = ashpd::AppID::try_from(APP_ID) else {
         return;
@@ -81,7 +90,8 @@ async fn register_host_app() {
     }
 }
 
-/// Requested Wayland `ScreenCast` source kind.
+/// Tipo de origem selecionado para abrir uma sessão `ScreenCast` no portal Wayland.
+/// Armazena: variantes `Monitor` e `Window` | Principais métodos: `to_portal`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaylandSource {
     /// Capture an entire monitor.
@@ -91,6 +101,8 @@ pub enum WaylandSource {
 }
 
 impl WaylandSource {
+    /// Converte `WaylandSource` no tipo `SourceType` correspondente da biblioteca `ashpd`.
+    /// Input: `self` | Output: `SourceType::Monitor` ou `SourceType::Window`
     fn to_portal(self) -> SourceType {
         match self {
             Self::Monitor => SourceType::Monitor,
@@ -99,7 +111,8 @@ impl WaylandSource {
     }
 }
 
-/// Active Wayland `ScreenCast` session handle for live screen recording (Phase 2).
+/// Sessão `ScreenCast` ativa no portal Wayland para gravação de tela contínua.
+/// Armazena: `pw_fd`, `node_id`, `had_saved_token`, `proxy`, `session` | Principais métodos: `reopen_pipewire_remote`, `close`
 pub struct WaylandScreencastSession {
     /// PipeWire remote fd to pass to `pipewiresrc`.
     pub pw_fd: OwnedFd,
@@ -112,7 +125,8 @@ pub struct WaylandScreencastSession {
 }
 
 impl WaylandScreencastSession {
-    /// Re-opens the PipeWire remote fd on an existing `ScreenCast` session (used when resuming).
+    /// Reabre o descritor remoto do PipeWire em uma sessão `ScreenCast` ativa ao retomar gravação.
+    /// Input: `&mut self` | Output: `Result<(), PlatformError>` atualizando `self.pw_fd`
     pub async fn reopen_pipewire_remote(&mut self) -> Result<(), PlatformError> {
         self.pw_fd = self
             .proxy
@@ -124,12 +138,15 @@ impl WaylandScreencastSession {
         Ok(())
     }
 
-    /// Closes the underlying D-Bus `ScreenCast` session so the compositor indicator stops.
+    /// Encerra a sessão `ScreenCast` no D-Bus para desligar o indicador de compartilhamento do compositor.
+    /// Input: `self` | Output: `()`
     pub async fn close(self) {
         let _ = self.session.close().await;
     }
 }
 
+/// Abre uma sessão ScreenCast no portal Wayland configurando tipo de origem e modo de cursor.
+/// Input: `source_type` (`SourceType`), `cursor_mode` (`CursorMode`) | Output: `Result<WaylandScreencastSession, PlatformError>`
 async fn open_screencast_session_with_options(
     source_type: SourceType,
     cursor_mode: CursorMode,
@@ -205,13 +222,16 @@ async fn open_screencast_session_with_options(
     })
 }
 
-/// Opens a persistent `ScreenCast` stream (reusing `restore_token` for monitors) for video recording.
+/// Abre uma sessão `ScreenCast` persistente no portal (reaproveitando `restore_token` em monitores) para gravação de vídeo com cursor embutido.
+/// Input: `source` (`WaylandSource`) | Output: `Result<WaylandScreencastSession, PlatformError>`
 pub async fn open_screencast_session_for(
     source: WaylandSource,
 ) -> Result<WaylandScreencastSession, PlatformError> {
     open_screencast_session_with_options(source.to_portal(), CursorMode::Embedded).await
 }
 
+/// Realiza a captura de um único quadro via sessão temporária do portal ScreenCast e PipeWire.
+/// Input: `source_type` (`SourceType`) | Output: `Result<CapturedImage, PlatformError>`
 async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage, PlatformError> {
     let WaylandScreencastSession {
         pw_fd,
@@ -221,8 +241,9 @@ async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage
         ..
     } = open_screencast_session_with_options(source_type, CursorMode::Hidden).await?;
 
+    let prefer_alpha = source_type == SourceType::Window;
     let frame_res = tokio::task::spawn_blocking(move || {
-        grab_single_pipewire_frame(pw_fd, node_id, !had_saved_token)
+        grab_single_pipewire_frame(pw_fd, node_id, !had_saved_token, prefer_alpha)
     })
     .await
     .map_err(|err| PlatformError::CaptureFailed(format!("PipeWire worker panicked: {err}")))?;
@@ -230,7 +251,14 @@ async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage
     // Close ScreenCast session immediately so the compositor sharing indicator disappears.
     let _ = session.close().await;
 
-    let (rgba, width, height) = frame_res?;
+    let (mut rgba, mut width, mut height) = frame_res?;
+    if prefer_alpha {
+        if let Some((trimmed, w, h)) = trim_transparent_border(&rgba, width, height) {
+            rgba = trimmed;
+            width = w;
+            height = h;
+        }
+    }
 
     let outputs = match query_wayland_outputs() {
         Ok(outs) if !outs.is_empty() => outs,
@@ -251,6 +279,43 @@ async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage
 
 type CapturedFrame = (Vec<u8>, u32, u32);
 
+/// Remove a margem transparente (sombras/bordas CSD) de um quadro RGBA devolvendo apenas a área opaca da janela.
+/// Input: `rgba` (`&[u8]`), `width` (`u32`), `height` (`u32`) | Output: `Option<(Vec<u8>, u32, u32)>` recortado, ou `None` se nada a recortar (sem alfa ou sem margem)
+fn trim_transparent_border(rgba: &[u8], width: u32, height: u32) -> Option<CapturedFrame> {
+    const OPAQUE_MIN: u8 = 250;
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return None;
+    }
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, 0usize, 0usize);
+    for y in 0..h {
+        let row = &rgba[y * w * 4..(y + 1) * w * 4];
+        for x in 0..w {
+            if row[x * 4 + 3] >= OPAQUE_MIN {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+    let (cw, ch) = (max_x - min_x + 1, max_y - min_y + 1);
+    if cw == w && ch == h {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cw * ch * 4);
+    for y in min_y..=max_y {
+        let start = (y * w + min_x) * 4;
+        out.extend_from_slice(&rgba[start..start + cw * 4]);
+    }
+    Some((out, cw as u32, ch as u32))
+}
+
+/// Estado compartilhado nos callbacks PipeWire durante a captura de um único quadro.
+/// Armazena: `format`, `captured`, `error` | Principais métodos: nenhum (tipo de estado interno)
 #[derive(Default)]
 struct StreamFrameState {
     format: Option<spa::param::video::VideoInfoRaw>,
@@ -258,10 +323,13 @@ struct StreamFrameState {
     error: Arc<Mutex<Option<String>>>,
 }
 
+/// Conecta-se a um nó PipeWire existente e extrai um único quadro convertido para RGBA.
+/// Input: `pw_fd` (`OwnedFd`), `node_id` (`u32`), `had_portal_dialog` (`bool`), `prefer_alpha` (`bool`, prioriza formatos com canal alfa para janelas) | Output: `Result<(Vec<u8>, u32, u32), PlatformError>` com buffer RGBA, largura e altura
 fn grab_single_pipewire_frame(
     pw_fd: OwnedFd,
     node_id: u32,
     had_portal_dialog: bool,
+    prefer_alpha: bool,
 ) -> Result<(Vec<u8>, u32, u32), PlatformError> {
     pw::init();
 
@@ -410,58 +478,113 @@ fn grab_single_pipewire_frame(
             PlatformError::CaptureFailed(format!("PipeWire listener register failed: {err}"))
         })?;
 
-    let obj = spa::pod::object!(
-        spa::utils::SpaTypes::ObjectParamFormat,
-        spa::param::ParamType::EnumFormat,
-        spa::pod::property!(
-            spa::param::format::FormatProperties::MediaType,
-            Id,
-            spa::param::format::MediaType::Video
-        ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::MediaSubtype,
-            Id,
-            spa::param::format::MediaSubtype::Raw
-        ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            VideoFormat::BGRx,
-            VideoFormat::BGRx,
-            VideoFormat::BGRA,
-            VideoFormat::RGBx,
-            VideoFormat::RGBA
-        ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            spa::utils::Rectangle {
-                width: 1920,
-                height: 1080
-            },
-            spa::utils::Rectangle {
-                width: 1,
-                height: 1
-            },
-            spa::utils::Rectangle {
-                width: 16384,
-                height: 16384
-            }
-        ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            spa::utils::Fraction { num: 60, denom: 1 },
-            spa::utils::Fraction { num: 0, denom: 1 },
-            spa::utils::Fraction { num: 144, denom: 1 }
-        ),
-    );
+    let obj = if prefer_alpha {
+        spa::pod::object!(
+            spa::utils::SpaTypes::ObjectParamFormat,
+            spa::param::ParamType::EnumFormat,
+            spa::pod::property!(
+                spa::param::format::FormatProperties::MediaType,
+                Id,
+                spa::param::format::MediaType::Video
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::MediaSubtype,
+                Id,
+                spa::param::format::MediaSubtype::Raw
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                VideoFormat::BGRA,
+                VideoFormat::BGRA,
+                VideoFormat::RGBA,
+                VideoFormat::BGRx,
+                VideoFormat::RGBx
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                spa::utils::Rectangle {
+                    width: 1920,
+                    height: 1080
+                },
+                spa::utils::Rectangle {
+                    width: 1,
+                    height: 1
+                },
+                spa::utils::Rectangle {
+                    width: 16384,
+                    height: 16384
+                }
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                spa::utils::Fraction { num: 60, denom: 1 },
+                spa::utils::Fraction { num: 0, denom: 1 },
+                spa::utils::Fraction { num: 144, denom: 1 }
+            ),
+        )
+    } else {
+        spa::pod::object!(
+            spa::utils::SpaTypes::ObjectParamFormat,
+            spa::param::ParamType::EnumFormat,
+            spa::pod::property!(
+                spa::param::format::FormatProperties::MediaType,
+                Id,
+                spa::param::format::MediaType::Video
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::MediaSubtype,
+                Id,
+                spa::param::format::MediaSubtype::Raw
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                VideoFormat::BGRx,
+                VideoFormat::BGRx,
+                VideoFormat::BGRA,
+                VideoFormat::RGBx,
+                VideoFormat::RGBA
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                spa::utils::Rectangle {
+                    width: 1920,
+                    height: 1080
+                },
+                spa::utils::Rectangle {
+                    width: 1,
+                    height: 1
+                },
+                spa::utils::Rectangle {
+                    width: 16384,
+                    height: 16384
+                }
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                spa::utils::Fraction { num: 60, denom: 1 },
+                spa::utils::Fraction { num: 0, denom: 1 },
+                spa::utils::Fraction { num: 144, denom: 1 }
+            ),
+        )
+    };
     let pod_bytes: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &spa::pod::Value::Object(obj),
@@ -501,6 +624,8 @@ fn grab_single_pipewire_frame(
     ))
 }
 
+/// Converte um buffer de vídeo SPA do PipeWire respeitando o stride de linha para pixels RGBA packed.
+/// Input: `fmt` (`VideoFormat`), `data` (`&[u8]`), `width` (`u32`), `height` (`u32`), `stride` (`usize`) | Output: `Result<Vec<u8>, String>` com bytes RGBA
 fn convert_spa_to_rgba(
     fmt: VideoFormat,
     data: &[u8],
@@ -573,6 +698,8 @@ fn convert_spa_to_rgba(
     Ok(rgba)
 }
 
+/// Converte um erro da biblioteca `ashpd` em `PlatformError` preservando cancelamento pelo usuário.
+/// Input: `err` (`ashpd::Error`) | Output: `PlatformError` equivalente
 fn map_ashpd_err(err: ashpd::Error) -> PlatformError {
     match err {
         ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled) => {
@@ -582,6 +709,8 @@ fn map_ashpd_err(err: ashpd::Error) -> PlatformError {
     }
 }
 
+/// Gera uma geometria de saída sintética única quando o compositor Wayland não informa monitores.
+/// Input: `width` (`u32`), `height` (`u32`) | Output: `OutputGeometry` cobrindo toda a imagem
 fn fallback_output(width: u32, height: u32) -> OutputGeometry {
     OutputGeometry {
         name: "wayland-0".to_string(),
@@ -593,6 +722,8 @@ fn fallback_output(width: u32, height: u32) -> OutputGeometry {
     }
 }
 
+/// Metadados brutos acumulados dos eventos Wayland `wl_output` e `zxdg_output_v1` para um monitor.
+/// Armazena: `global_name`, `name`, `scale_factor`, `mode_width`, `mode_height`, `logical_x`, `logical_y`, `logical_w`, `logical_h` | Principais métodos: nenhum (tipo de dados)
 #[derive(Debug, Default)]
 struct RawOutputInfo {
     global_name: u32,
@@ -606,6 +737,8 @@ struct RawOutputInfo {
     logical_h: Option<i32>,
 }
 
+/// Estado do cliente Wayland usado durante o roundtrip de enumeração de monitores.
+/// Armazena: `xdg_output_manager`, `outputs`, `xdg_to_global` | Principais métodos: `Dispatch::event`
 struct WaylandOutputState {
     xdg_output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     outputs: HashMap<u32, (wl_output::WlOutput, RawOutputInfo)>,
@@ -613,6 +746,8 @@ struct WaylandOutputState {
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandOutputState {
+    /// Processa anúncios globais do registro Wayland vinculando `wl_output` e `zxdg_output_manager_v1`.
+    /// Input: `state`, `registry`, `event`, `_`, `_`, `qh` | Output: `()` atualizando `state`
     fn event(
         state: &mut Self,
         registry: &wl_registry::WlRegistry,
@@ -664,6 +799,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandOutputState {
 }
 
 impl Dispatch<wl_output::WlOutput, u32> for WaylandOutputState {
+    /// Recebe eventos de modo atual, fator de escala e nome de cada `wl_output` registrado.
+    /// Input: `state`, `_`, `event`, `global_name`, `_`, `_` | Output: `()` atualizando `RawOutputInfo`
     fn event(
         state: &mut Self,
         _: &wl_output::WlOutput,
@@ -696,6 +833,8 @@ impl Dispatch<wl_output::WlOutput, u32> for WaylandOutputState {
 }
 
 impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for WaylandOutputState {
+    /// Trata eventos do gerenciador `zxdg_output_manager_v1` (protocolo sem eventos no cliente).
+    /// Input: `_` (estado, proxy, evento, dados, conexão, fila) | Output: `()`
     fn event(
         _: &mut Self,
         _: &zxdg_output_manager_v1::ZxdgOutputManagerV1,
@@ -708,6 +847,8 @@ impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for WaylandOutput
 }
 
 impl Dispatch<zxdg_output_v1::ZxdgOutputV1, u32> for WaylandOutputState {
+    /// Coleta posição lógica, tamanho lógico e nome estendido reportados por `zxdg_output_v1`.
+    /// Input: `state`, `_`, `event`, `global_name`, `_`, `_` | Output: `()` atualizando `RawOutputInfo`
     fn event(
         state: &mut Self,
         _: &zxdg_output_v1::ZxdgOutputV1,
@@ -735,8 +876,8 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, u32> for WaylandOutputState {
     }
 }
 
-/// Queries active Wayland outputs and their logical/physical geometries via
-/// `wl_output` and `zxdg_output_manager_v1`.
+/// Consulta os monitores ativos e suas geometrias lógicas/físicas no compositor Wayland via `wl_output` e `zxdg_output_manager_v1`.
+/// Input: nenhum | Output: `Result<Vec<OutputGeometry>, PlatformError>` ordenado por `global_name`
 pub fn query_wayland_outputs() -> Result<Vec<OutputGeometry>, PlatformError> {
     let conn = Connection::connect_to_env()
         .map_err(|e| PlatformError::CaptureFailed(format!("wayland connect failed: {e}")))?;
@@ -788,4 +929,28 @@ pub fn query_wayland_outputs() -> Result<Vec<OutputGeometry>, PlatformError> {
         .collect();
 
     Ok(geometries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trims_transparent_shadow_around_opaque_window() {
+        let (w, h) = (6u32, 5u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 1..4usize {
+            for x in 2..5usize {
+                let i = (y * w as usize + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&[10, 20, 30, 255]);
+            }
+        }
+        let (out, cw, ch) = trim_transparent_border(&rgba, w, h).unwrap();
+        assert_eq!((cw, ch), (3, 3));
+        assert_eq!(out.len(), 3 * 3 * 4);
+        assert!(out.chunks(4).all(|p| p == [10, 20, 30, 255]));
+
+        let opaque = vec![255u8; (w * h * 4) as usize];
+        assert!(trim_transparent_border(&opaque, w, h).is_none());
+    }
 }

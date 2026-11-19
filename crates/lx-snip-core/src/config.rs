@@ -1,4 +1,7 @@
-//! Application configuration schema and atomic persistence.
+//! Módulo: `config`
+//! Objetivos: Definir o esquema de configuração da aplicação e garantir leitura e gravação atômica em TOML.
+//! Principais itens: `CaptureMode`, `AppConfig`, `ConfigError`, `default_config_path`, `load_or_default` e `save_atomic`.
+//! Última alteração: 2026-11-19
 
 use std::fs;
 use std::io::Write;
@@ -9,41 +12,45 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Default maximum number of snips retained in local history.
+/// Limite padrão de capturas PNG mantidas no histórico local.
 pub const DEFAULT_HISTORY_MAX_ITEMS: usize = 50;
 
-/// Supported screen capture modes.
+/// Enumera os modos de captura e gravação suportados pela aplicação.
+/// Armazena: variantes `Rect`, `Freeform`, `Window`, `Fullscreen` e `Record` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CaptureMode {
-    /// Rectangular region selection.
+    /// Seleção retangular para captura de imagem.
     #[default]
     Rect,
-    /// Freeform lasso selection.
+    /// Seleção à mão livre (laço).
     Freeform,
-    /// Single window capture.
+    /// Captura de uma janela individual.
     Window,
-    /// Fullscreen (all outputs) capture.
+    /// Captura de toda a área de trabalho em tela cheia.
     Fullscreen,
-    /// Rectangular region screen recording (Phase 2).
+    /// Modo de gravação de tela (vídeo e áudio).
     Record,
 }
 
-/// Persistent user configuration stored at `$XDG_CONFIG_HOME/lx-snippingtool/config.toml`.
+/// Representa a configuração persistente do usuário armazenada em `config.toml`.
+/// Armazena: `default_mode`, `default_delay_secs`, `auto_copy` e `history_max_items` | Principais métodos: `Default::default`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
-    /// Default capture mode when launched without `--mode`.
+    /// Modo padrão usado quando o app abre sem `--mode`.
     pub default_mode: CaptureMode,
-    /// Default pre-capture delay in seconds (e.g. 0, 3, 5, 10).
+    /// Atraso padrão em segundos antes da captura (`0`, `3`, `5` ou `10`).
     pub default_delay_secs: u8,
-    /// Whether completed snips are automatically copied to the clipboard.
+    /// Define se a imagem exportada é copiada automaticamente para a área de transferência.
     pub auto_copy: bool,
-    /// Maximum number of PNG files retained in the local snip history directory.
+    /// Quantidade máxima de arquivos PNG mantidos no histórico local.
     pub history_max_items: usize,
 }
 
 impl Default for AppConfig {
+    /// Constrói a configuração padrão inicial da aplicação.
+    /// Input: nenhum | Output: instância padrão de `AppConfig`.
     fn default() -> Self {
         Self {
             default_mode: CaptureMode::Rect,
@@ -54,38 +61,41 @@ impl Default for AppConfig {
     }
 }
 
-/// Errors that can occur while loading or saving [`AppConfig`].
+/// Enumera as falhas possíveis ao localizar, ler, validar ou salvar `AppConfig`.
+/// Armazena: variantes `NoConfigDir`, `Io`, `Parse` e `Serialize` | Principais métodos: `Display`, `Error`.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// Failed to resolve the XDG configuration directory.
+    /// Falha ao resolver o diretório de configuração XDG.
     #[error("unable to determine XDG configuration directory")]
     NoConfigDir,
-    /// Filesystem I/O failure.
+    /// Erro de entrada/saída ao acessar o arquivo de configuração.
     #[error("config I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// TOML deserialization failure.
+    /// Erro ao interpretar o arquivo TOML.
     #[error("failed to parse config TOML: {0}")]
     Parse(#[from] toml::de::Error),
-    /// TOML serialization failure.
+    /// Erro ao serializar a estrutura em TOML.
     #[error("failed to serialize config TOML: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
 
-/// Resolves the default configuration file path (`$XDG_CONFIG_HOME/lx-snippingtool/config.toml`).
+/// Resolve o caminho padrão do arquivo de configuração XDG da aplicação.
+/// Input: nenhum | Output: `Result<PathBuf, ConfigError>` apontando para `config.toml`.
 pub fn default_config_path() -> Result<PathBuf, ConfigError> {
     let dirs = ProjectDirs::from("io.github", "lx_snippingtool", "lx-snippingtool")
         .ok_or(ConfigError::NoConfigDir)?;
     Ok(dirs.config_dir().join("config.toml"))
 }
 
-/// Loads [`AppConfig`] from the default XDG config path, returning [`AppConfig::default()`]
-/// if the file does not exist yet.
+/// Carrega a configuração do caminho XDG padrão ou devolve os valores padrão se ausente.
+/// Input: nenhum | Output: `Result<AppConfig, ConfigError>` com a configuração carregada.
 pub fn load_or_default() -> Result<AppConfig, ConfigError> {
     let path = default_config_path()?;
     load_or_default_from(&path)
 }
 
-/// Loads [`AppConfig`] from `path`, returning [`AppConfig::default()`] if `path` does not exist.
+/// Lê `AppConfig` de um caminho específico, retornando `AppConfig::default()` se o arquivo não existir.
+/// Input: `path` do arquivo TOML | Output: `Result<AppConfig, ConfigError>` carregado ou padrão.
 pub fn load_or_default_from(path: &Path) -> Result<AppConfig, ConfigError> {
     match fs::read_to_string(path) {
         Ok(contents) => Ok(toml::from_str(&contents)?),
@@ -94,13 +104,15 @@ pub fn load_or_default_from(path: &Path) -> Result<AppConfig, ConfigError> {
     }
 }
 
-/// Atomically writes `config` to the default XDG config path.
+/// Salva `AppConfig` de forma atômica no caminho XDG padrão.
+/// Input: referência a `AppConfig` | Output: `Result<(), ConfigError>` indicando sucesso ou erro.
 pub fn save_atomic(config: &AppConfig) -> Result<(), ConfigError> {
     let path = default_config_path()?;
     save_atomic_to(config, &path)
 }
 
-/// Atomically writes `config` to `path` via a sibling temporary file and rename.
+/// Escreve `AppConfig` de forma atômica em `path` usando arquivo temporário e `rename`.
+/// Input: referência a `AppConfig` e `path` de destino | Output: `Result<(), ConfigError>` da operação.
 pub fn save_atomic_to(config: &AppConfig, path: &Path) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

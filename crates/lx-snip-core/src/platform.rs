@@ -1,77 +1,87 @@
-//! Platform abstraction traits for screen capture and clipboard ownership.
+//! Módulo: `platform`
+//! Objetivos: Definir traits e estruturas de abstração entre backends de captura e área de transferência (Wayland e X11).
+//! Principais itens: `PlatformFuture`, `OutputGeometry`, `CapturedImage`, `PlatformError`, `CaptureBackend` e `ClipboardBackend`.
+//! Última alteração: 2026-11-19
 
 use std::future::Future;
 use std::pin::Pin;
 
 use thiserror::Error;
 
-/// Boxed future type used by object-safe async platform traits.
+/// Futuro assíncrono em `Box` usado pelos traits de plataforma compatíveis com dispatch dinâmico.
 pub type PlatformFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, PlatformError>> + Send + 'a>>;
 
-/// Logical/physical geometry of a single display output.
+/// Descreve a geometria lógica e escala de um monitor conectado.
+/// Armazena: `name`, coordenadas `x`/`y`, dimensões `width`/`height` e `scale_factor` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputGeometry {
-    /// Compositor or RandR output name (e.g. `DP-1`, `eDP-1`).
+    /// Nome da saída no compositor ou RandR (ex.: `DP-1`, `eDP-1`).
     pub name: String,
-    /// X origin in global compositor coordinate space.
+    /// Origem X no espaço global de coordenadas do compositor.
     pub x: i32,
-    /// Y origin in global compositor coordinate space.
+    /// Origem Y no espaço global de coordenadas do compositor.
     pub y: i32,
-    /// Width in pixels.
+    /// Largura da saída em pixels.
     pub width: u32,
-    /// Height in pixels.
+    /// Altura da saída em pixels.
     pub height: u32,
-    /// Display scale factor (e.g. `1.0`, `2.0`).
+    /// Fator de escala configurado no monitor (ex.: `1.0`, `2.0`).
     pub scale_factor: f64,
 }
 
-/// Raw captured desktop or window image in straight RGBA8 format.
+/// Representa uma imagem capturada em memória no formato RGBA8 não pré-multiplicado.
+/// Armazena: buffer `rgba`, `width`, `height` e lista `outputs` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedImage {
-    /// Straight RGBA8 pixel buffer (`width * height * 4` bytes).
+    /// Buffer de pixels RGBA8 (`width * height * 4` bytes).
     pub rgba: Vec<u8>,
-    /// Image width in pixels.
+    /// Largura da imagem em pixels.
     pub width: u32,
-    /// Image height in pixels.
+    /// Altura da imagem em pixels.
     pub height: u32,
-    /// Output geometries covering the captured surface.
+    /// Geometrias dos monitores cobertos pela captura.
     pub outputs: Vec<OutputGeometry>,
 }
 
-/// Errors returned by [`CaptureBackend`] and [`ClipboardBackend`] implementations.
+/// Enumera os erros retornados pelos backends de captura e clipboard.
+/// Armazena: variantes `Unsupported`, `CaptureFailed`, `ClipboardFailed` e `Cancelled` | Principais métodos: `Display`, `Error`.
 #[derive(Debug, Error)]
 pub enum PlatformError {
-    /// Requested capability is unsupported on the active compositor/session.
+    /// Operação não suportada na sessão ou compositor ativo.
     #[error("unsupported platform operation: {0}")]
     Unsupported(String),
-    /// Screen or window capture failed.
+    /// Falha ao capturar a tela ou janela.
     #[error("capture failed: {0}")]
     CaptureFailed(String),
-    /// Clipboard ownership or transfer failed.
+    /// Falha ao publicar ou manter dados na área de transferência.
     #[error("clipboard failed: {0}")]
     ClipboardFailed(String),
-    /// User cancelled the portal or selection prompt.
+    /// Operação cancelada pelo usuário no portal ou overlay.
     #[error("operation cancelled by user")]
     Cancelled,
 }
 
-/// Abstraction over Wayland portal and X11 screen capture backends.
+/// Define a interface padrão para backends de captura de tela (Wayland Portal ou X11).
+/// Armazena: nenhum (trait) | Principais métodos: `supports_window_mode`, `capture_desktop`, `capture_window`.
 pub trait CaptureBackend: Send + Sync {
-    /// Returns `true` if the backend supports enumerating/capturing individual windows
-    /// inside the freeze-frame overlay (X11) rather than requiring pre-freeze portal selection.
+    /// Indica se o backend suporta seleção direta de janela dentro do overlay congelado.
+    /// Input: `&self` | Output: `true` no X11 ou `false` quando requer portal prévio.
     fn supports_window_mode(&self) -> bool;
 
-    /// Captures the full desktop across all active outputs.
+    /// Captura a área de trabalho completa cobrindo todas as saídas ativas.
+    /// Input: `&self` | Output: `PlatformFuture` resolvendo em `CapturedImage`.
     fn capture_desktop(&self) -> PlatformFuture<'_, CapturedImage>;
 
-    /// Captures a single window (e.g. via interactive portal on Wayland or `_NET_CLIENT_LIST` on X11).
+    /// Captura uma janela específica por seletor do portal ou lista do servidor X11.
+    /// Input: `&self` | Output: `PlatformFuture` resolvendo em `CapturedImage`.
     fn capture_window(&self) -> PlatformFuture<'_, CapturedImage>;
 }
 
-/// Abstraction over Wayland `data-control` and X11/XWayland clipboard holders.
+/// Define a interface para publicação persistente de PNG na área de transferência.
+/// Armazena: nenhum (trait) | Principais métodos: `copy_png_and_hold`.
 pub trait ClipboardBackend: Send + Sync {
-    /// Publishes `png_bytes` as `image/png` on the clipboard and holds ownership
-    /// until selection ownership is replaced or lost.
+    /// Publica um PNG na área de transferência e mantém a posse até ser substituído.
+    /// Input: `&self` e `png_bytes` codificados | Output: `PlatformFuture` indicando conclusão ou erro.
     fn copy_png_and_hold(&self, png_bytes: Vec<u8>) -> PlatformFuture<'_, ()>;
 }

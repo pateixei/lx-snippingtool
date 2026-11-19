@@ -1,6 +1,7 @@
-//! Phase 2 GStreamer screen recorder (`gst-launch-1.0 -e`) using PipeWire `ScreenCast`
-//! on Wayland (with `restore_token`) and `ximagesrc` on X11, supporting Pause/Resume
-//! via lossless segment concatenation.
+//! Módulo: `recorder`
+//! Objetivos: Gerenciar gravação de tela em Wayland (`ScreenCast`/PipeWire) e X11 (`ximagesrc`) via GStreamer (`gst-launch-1.0 -e`), com áudio do sistema/microfone e pausa/retomada por concatenação sem perdas.
+//! Principais itens: `RecordingTarget`, `VideoProfile`, `PreparedRecording`, `ActiveRecording`, `prepare_recording`, `probe_video_profile`, `save_recording_to_path`
+//! Última alteração: 2026-11-19
 
 use std::fs;
 use std::io::Read;
@@ -20,7 +21,8 @@ use crate::capture_wayland::{
     open_screencast_session_for, WaylandScreencastSession, WaylandSource,
 };
 
-/// Recording target selected in Level 2 of the capture overlay.
+/// Alvo de captura escolhido no Nível 2 do overlay para gravação de vídeo.
+/// Armazena: variantes `Fullscreen`, `Region` (`rect`, `full_width`, `full_height`) e `Window` | Principais métodos: nenhum (enumeração de configuração)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecordingTarget {
     /// Entire desktop / default monitor.
@@ -38,7 +40,8 @@ pub enum RecordingTarget {
     Window,
 }
 
-/// Detected GStreamer video/audio encoder & container profile.
+/// Perfil de codificação de vídeo e contêiner detectado dinamicamente no GStreamer.
+/// Armazena: variantes `Mp4H264`, `WebmVp8` e `WebmVp9` | Principais métodos: `ext`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoProfile {
     /// H.264 (`x264enc`) + Opus in MP4 (`mp4mux`).
@@ -50,7 +53,8 @@ pub enum VideoProfile {
 }
 
 impl VideoProfile {
-    /// Output file extension.
+    /// Retorna a extensão de arquivo correspondente ao perfil de contêiner selecionado.
+    /// Input: `self` | Output: `"mp4"` ou `"webm"`
     pub fn ext(self) -> &'static str {
         match self {
             Self::Mp4H264 => "mp4",
@@ -59,6 +63,8 @@ impl VideoProfile {
     }
 }
 
+/// Parâmetros internos consolidados para instanciar segmentos do pipeline GStreamer.
+/// Armazena: `is_wayland`, `target`, `profile`, `with_system_audio`, `with_mic`, `has_audio` | Principais métodos: nenhum (estrutura de dados)
 #[derive(Debug, Clone, Copy)]
 struct RecordingPipelineConfig {
     is_wayland: bool,
@@ -69,7 +75,8 @@ struct RecordingPipelineConfig {
     has_audio: bool,
 }
 
-/// Active screen recording process handle with Pause/Resume support.
+/// Controlador de uma sessão ativa de gravação de tela com suporte a pausa e retomada em múltiplos segmentos.
+/// Armazena: `config`, `final_output_path`, `segments`, `current_child`, `wayland_session`, `accumulated_duration`, `segment_started_at`, `paused`, `last_stderr` | Principais métodos: `elapsed_secs`, `pause`, `resume`, `stop`
 pub struct ActiveRecording {
     config: RecordingPipelineConfig,
     final_output_path: PathBuf,
@@ -83,7 +90,8 @@ pub struct ActiveRecording {
 }
 
 impl ActiveRecording {
-    /// Elapsed active recording time in seconds (excluding paused intervals).
+    /// Calcula o tempo total ativo de gravação em segundos desconsiderando intervalos em pausa.
+    /// Input: `&self` | Output: duração acumulada em segundos (`u64`)
     pub fn elapsed_secs(&self) -> u64 {
         let active = self
             .segment_started_at
@@ -92,7 +100,8 @@ impl ActiveRecording {
         (self.accumulated_duration + active).as_secs()
     }
 
-    /// Pauses an active recording by cleanly finalizing the current GStreamer segment.
+    /// Pausa a gravação ativa finalizando de forma limpa o processo GStreamer do segmento corrente.
+    /// Input: `&mut self` | Output: `Result<(), String>`
     pub async fn pause(&mut self) -> Result<(), String> {
         if self.paused {
             return Ok(());
@@ -114,7 +123,8 @@ impl ActiveRecording {
         Ok(())
     }
 
-    /// Resumes a paused recording by starting a new GStreamer segment and refreshing the PipeWire fd.
+    /// Retoma uma gravação pausada reabrindo o descritor PipeWire em Wayland e iniciando novo segmento GStreamer.
+    /// Input: `&mut self` | Output: `Result<(), String>`
     pub async fn resume(&mut self) -> Result<(), String> {
         if !self.paused {
             return Ok(());
@@ -163,8 +173,8 @@ impl ActiveRecording {
         Ok(())
     }
 
-    /// Stops recording, closes the Wayland session, concatenates segments if paused/resumed,
-    /// and returns `(final_path, elapsed_secs)`.
+    /// Encerra a gravação ativa, fecha a sessão Wayland, concatena segmentos se necessário e informa arquivo e duração.
+    /// Input: `mut self` | Output: `Result<(PathBuf, u64), String>` com caminho temporário final e duração em segundos
     pub async fn stop(mut self) -> Result<(PathBuf, u64), String> {
         if let Some(child) = self.current_child.take() {
             let err = stop_gst_child(child).await?;
@@ -222,6 +232,8 @@ impl ActiveRecording {
     }
 }
 
+/// Envia `SIGINT` ao processo filho `gst-launch-1.0` para emissão de EOS e lê a saída `stderr`.
+/// Input: `mut child` (`Child`) | Output: `Result<String, String>` com o `stderr` coletado
 async fn stop_gst_child(mut child: Child) -> Result<String, String> {
     let pid = child.id() as libc::pid_t;
     // SAFETY: sending SIGINT to our own spawned gst-launch-1.0 child pid so `-e` emits EOS.
@@ -253,6 +265,8 @@ async fn stop_gst_child(mut child: Child) -> Result<String, String> {
     Ok(err_text)
 }
 
+/// Verifica se um plugin GStreamer está instalado no sistema consultando `gst-inspect-1.0`.
+/// Input: `name` (`&str`) | Output: `bool` (`true` se disponível)
 fn gst_has_plugin(name: &str) -> bool {
     Command::new("gst-inspect-1.0")
         .arg(name)
@@ -262,7 +276,8 @@ fn gst_has_plugin(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Probes available GStreamer encoders at runtime (royalty-free WebM fallback if H.264 is absent).
+/// Detecta em tempo de execução os encoders e multiplexadores GStreamer disponíveis (com fallback para WebM).
+/// Input: nenhum | Output: `Result<VideoProfile, String>`
 pub fn probe_video_profile() -> Result<VideoProfile, String> {
     if !gst_has_plugin("pipewiresrc") && !gst_has_plugin("ximagesrc") {
         return Err(
@@ -284,27 +299,70 @@ pub fn probe_video_profile() -> Result<VideoProfile, String> {
     }
 }
 
-fn next_recording_path(ext: &str) -> Result<PathBuf, String> {
-    let (dir, restricted) = if let Some(video_dir) =
-        UserDirs::new().and_then(|u| u.video_dir().map(|d| d.join("SnippingTool")))
-    {
-        (video_dir, false)
+/// Resolve o caminho padrão de destino para salvar uma gravação com timestamp local legível.
+/// Input: `ext` (`&str`) | Output: `PathBuf` em `Vídeos/SnippingTool/gravacao_YYYY-MM-DD_HH-MM-SS.<ext>`
+pub fn default_recording_save_path(ext: &str) -> PathBuf {
+    let dir = UserDirs::new()
+        .and_then(|u| u.video_dir().map(|d| d.join("SnippingTool")))
+        .or_else(|| {
+            ProjectDirs::from("", "", "lx-snippingtool").map(|p| p.data_dir().join("recordings"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` writes into stack-allocated `tm` using valid `now`.
+    let local_ptr = unsafe { libc::localtime_r(&now, &mut tm) };
+    let file_name = if !local_ptr.is_null() {
+        format!(
+            "gravacao_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.{ext}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
     } else {
-        let proj = ProjectDirs::from("", "", "lx-snippingtool")
-            .ok_or_else(|| "unable to resolve XDG data dir".to_string())?;
-        (proj.data_dir().join("recordings"), true)
+        format!("gravacao_{now}.{ext}")
     };
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    if restricted {
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    dir.join(file_name)
+}
+
+/// Move ou copia entre sistemas de arquivos o vídeo temporário para o destino escolhido e remove o temporário.
+/// Input: `src` (`&Path`), `dest` (`&Path`) | Output: `Result<(), String>`
+pub fn save_recording_to_path(src: &Path, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("failed to create save directory: {e}"))?;
     }
+    if fs::rename(src, dest).is_ok() {
+        return Ok(());
+    }
+    fs::copy(src, dest).map_err(|e| format!("failed to copy recording: {e}"))?;
+    let _ = fs::remove_file(src);
+    Ok(())
+}
+
+/// Gera um caminho temporário exclusivo no diretório de cache seguro (`0o700`) para armazenar a gravação pendente.
+/// Input: `ext` (`&str`) | Output: `Result<PathBuf, String>`
+fn next_temp_recording_path(ext: &str) -> Result<PathBuf, String> {
+    let dir = ProjectDirs::from("", "", "lx-snippingtool")
+        .map(|p| p.cache_dir().join("pending"))
+        .unwrap_or_else(|| std::env::temp_dir().join("lx-snippingtool"));
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    Ok(dir.join(format!("rec_{ms}_{}.{ext}", Uuid::new_v4())))
+    Ok(dir.join(format!("pending_{ms}_{}.{ext}", Uuid::new_v4())))
 }
 
+/// Constrói o caminho de um arquivo de segmento parcial associado à gravação final.
+/// Input: `final_path` (`&Path`), `index` (`usize`), `ext` (`&str`) | Output: `PathBuf` oculto `.part<index>`
 fn segment_path(final_path: &Path, index: usize, ext: &str) -> PathBuf {
     let stem = final_path
         .file_stem()
@@ -314,7 +372,8 @@ fn segment_path(final_path: &Path, index: usize, ext: &str) -> PathBuf {
     parent.join(format!(".{stem}.part{index}.{ext}"))
 }
 
-/// Computes `(top, bottom, left, right)` even-aligned `videocrop` margins for GStreamer.
+/// Calcula as margens `(top, bottom, left, right)` alinhadas a múltiplos pares para o elemento `videocrop` do GStreamer.
+/// Input: `rect` (`Rect`), `full_w` (`u32`), `full_h` (`u32`) | Output: tupla `(top, bottom, left, right)`
 pub fn compute_videocrop(rect: Rect, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
     let r = rect.normalized().clamp(full_w as f32, full_h as f32);
     let mut left = (r.x.round() as u32) & !1;
@@ -340,6 +399,8 @@ pub fn compute_videocrop(rect: Rect, full_w: u32, full_h: u32) -> (u32, u32, u32
     (top, bottom, left, right)
 }
 
+/// Inicia um processo filho `gst-launch-1.0 -e` para gravar um segmento de vídeo e áudio conforme a configuração.
+/// Input: `config` (`&RecordingPipelineConfig`), `output_path` (`&Path`), `wayland_session` (`Option<&WaylandScreencastSession>`) | Output: `Result<Child, String>`
 async fn spawn_gst_segment(
     config: &RecordingPipelineConfig,
     output_path: &Path,
@@ -394,6 +455,9 @@ async fn spawn_gst_segment(
                 "x264enc".to_string(),
                 "tune=zerolatency".to_string(),
                 "speed-preset=veryfast".to_string(),
+                "pass=quant".to_string(),
+                "quantizer=22".to_string(),
+                "key-int-max=60".to_string(),
                 "!".to_string(),
                 "video/x-h264,profile=main".to_string(),
                 "!".to_string(),
@@ -409,6 +473,7 @@ async fn spawn_gst_segment(
                 "vp8enc".to_string(),
                 "deadline=1".to_string(),
                 "threads=4".to_string(),
+                "target-bitrate=8000000".to_string(),
                 "!".to_string(),
                 "queue".to_string(),
                 "!".to_string(),
@@ -422,6 +487,7 @@ async fn spawn_gst_segment(
                 "vp9enc".to_string(),
                 "deadline=1".to_string(),
                 "threads=4".to_string(),
+                "target-bitrate=8000000".to_string(),
                 "!".to_string(),
                 "queue".to_string(),
                 "!".to_string(),
@@ -543,7 +609,8 @@ async fn spawn_gst_segment(
     }
 }
 
-/// Builds `gst-launch-1.0` arguments to losslessly concatenate paused/resumed recording segments.
+/// Monta os argumentos do `gst-launch-1.0` para concatenar segmentos gravados entre pausas sem recodificação.
+/// Input: `segments` (`&[PathBuf]`), `output_path` (`&Path`), `profile` (`VideoProfile`), `has_audio` (`bool`) | Output: `Vec<String>` com a linha de pipeline
 pub fn build_concat_args(
     segments: &[PathBuf],
     output_path: &Path,
@@ -615,6 +682,8 @@ pub fn build_concat_args(
     args
 }
 
+/// Executa `gst-launch-1.0` para mesclar múltiplos arquivos de segmento em um único vídeo final.
+/// Input: `segments` (`&[PathBuf]`), `output_path` (`&Path`), `profile` (`VideoProfile`), `has_audio` (`bool`) | Output: `Result<(), String>`
 async fn concat_segments(
     segments: &[PathBuf],
     output_path: &Path,
@@ -640,17 +709,70 @@ async fn concat_segments(
     Ok(())
 }
 
-/// Starts a Wayland or X11 GStreamer screen recording for the given [`RecordingTarget`].
-pub async fn start_recording(
+/// Sessão de gravação já preparada e autorizada, aguardando a contagem regressiva para iniciar o GStreamer.
+/// Armazena: `config`, `final_output_path` e `wayland_session` | Principais métodos: `start`, `cancel`
+pub struct PreparedRecording {
+    config: RecordingPipelineConfig,
+    final_output_path: PathBuf,
+    wayland_session: Option<WaylandScreencastSession>,
+}
+
+impl PreparedRecording {
+    /// Inicia efetivamente o processo `gst-launch-1.0` do primeiro segmento após a contagem regressiva.
+    /// Input: `mut self` | Output: `Result<ActiveRecording, String>`
+    pub async fn start(mut self) -> Result<ActiveRecording, String> {
+        let seg0 = segment_path(&self.final_output_path, 0, self.config.profile.ext());
+        let child =
+            match spawn_gst_segment(&self.config, &seg0, self.wayland_session.as_ref()).await {
+                Ok(child) => child,
+                Err(err) => {
+                    if let Some(session) = self.wayland_session.take() {
+                        session.close().await;
+                    }
+                    return Err(err);
+                }
+            };
+
+        info!(
+            path = %self.final_output_path.display(),
+            profile = ?self.config.profile,
+            target = ?self.config.target,
+            "started screen recording"
+        );
+        Ok(ActiveRecording {
+            config: self.config,
+            final_output_path: self.final_output_path,
+            segments: vec![seg0],
+            current_child: Some(child),
+            wayland_session: self.wayland_session,
+            accumulated_duration: Duration::ZERO,
+            segment_started_at: Some(Instant::now()),
+            paused: false,
+            last_stderr: String::new(),
+        })
+    }
+
+    /// Cancela a gravação preparada antes do início do GStreamer e fecha a sessão Wayland, se existir.
+    /// Input: `mut self` | Output: nenhum (`()`)
+    pub async fn cancel(mut self) {
+        if let Some(session) = self.wayland_session.take() {
+            session.close().await;
+        }
+    }
+}
+
+/// Prepara perfil, caminho temporário e sessão Wayland/X11 de gravação sem disparar o pipeline GStreamer ainda.
+/// Input: `is_wayland` (`bool`), `target` (`RecordingTarget`), `with_system_audio` (`bool`), `with_mic` (`bool`) | Output: `Result<PreparedRecording, String>`
+pub async fn prepare_recording(
     is_wayland: bool,
     target: RecordingTarget,
     with_system_audio: bool,
     with_mic: bool,
-) -> Result<ActiveRecording, String> {
+) -> Result<PreparedRecording, String> {
     let profile = probe_video_profile()?;
-    let final_output_path = next_recording_path(profile.ext())?;
+    let final_output_path = next_temp_recording_path(profile.ext())?;
 
-    let mut wayland_session = if is_wayland {
+    let wayland_session = if is_wayland {
         if !gst_has_plugin("pipewiresrc") {
             return Err("GStreamer pipewiresrc plugin is missing".to_string());
         }
@@ -681,28 +803,10 @@ pub async fn start_recording(
         has_audio,
     };
 
-    let seg0 = segment_path(&final_output_path, 0, profile.ext());
-    let child = match spawn_gst_segment(&config, &seg0, wayland_session.as_ref()).await {
-        Ok(child) => child,
-        Err(err) => {
-            if let Some(session) = wayland_session.take() {
-                session.close().await;
-            }
-            return Err(err);
-        }
-    };
-
-    info!(path = %final_output_path.display(), ?profile, ?target, "started screen recording");
-    Ok(ActiveRecording {
+    Ok(PreparedRecording {
         config,
         final_output_path,
-        segments: vec![seg0],
-        current_child: Some(child),
         wayland_session,
-        accumulated_duration: Duration::ZERO,
-        segment_started_at: Some(Instant::now()),
-        paused: false,
-        last_stderr: String::new(),
     })
 }
 
@@ -747,5 +851,16 @@ mod tests {
         assert!(args.contains(&"webmmux".to_string()));
         assert!(!args.contains(&"h264parse".to_string()));
         assert!(args.contains(&"opusparse".to_string()));
+    }
+
+    #[test]
+    fn default_save_path_uses_readable_timestamp() {
+        let path = default_recording_save_path("mp4");
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("mp4"));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(name.starts_with("gravacao_"));
     }
 }

@@ -1,4 +1,7 @@
-//! X11 screen and window capture backend using `x11rb` (`shm`, `randr`, `_NET_CLIENT_LIST`).
+//! Módulo: `capture_x11`
+//! Objetivos: Capturar a área de trabalho e enumerar janelas e monitores no servidor X11 via XShm, GetImage, RandR e `_NET_CLIENT_LIST`.
+//! Principais itens: `X11WindowBounds`, `X11CaptureBackend`, `list_x11_windows`, `capture_via_shm` e `query_randr_outputs`.
+//! Última alteração: 2026-11-19
 
 use std::fs::OpenOptions;
 use std::os::unix::io::OwnedFd;
@@ -15,32 +18,39 @@ use x11rb::protocol::shm::{self, ConnectionExt as ShmExt};
 use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt as XprotoExt, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
 
-/// Geometry and title of a mapped X11 top-level window.
+/// Representa o identificador e o retângulo delimitador de uma janela X11 visível.
+/// Armazena: identificador `window` e `rect` em coordenadas root | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone)]
 pub struct X11WindowBounds {
-    /// X11 window ID.
+    /// Identificador da janela X11.
     #[allow(dead_code)]
     pub window: Window,
-    /// Bounding rectangle in root coordinates.
+    /// Retângulo delimitador na tela em coordenadas globais X11.
     pub rect: Rect,
 }
 
-/// X11 capture backend using XShm (`shm`), RandR (`randr`), and `_NET_CLIENT_LIST`.
+/// Implementa o backend de captura de tela X11 com XShm, RandR e lista de janelas.
+/// Armazena: estrutura unitária sem campos | Principais métodos: `new`, `supports_window_mode`, `capture_desktop`, `capture_window`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct X11CaptureBackend;
 
 impl X11CaptureBackend {
-    /// Creates a new [`X11CaptureBackend`].
+    /// Cria uma nova instância de `X11CaptureBackend`.
+    /// Input: nenhum | Output: `X11CaptureBackend`.
     pub const fn new() -> Self {
         Self
     }
 }
 
 impl CaptureBackend for X11CaptureBackend {
+    /// Informa que o X11 suporta escolha interativa de janela dentro do overlay congelado.
+    /// Input: `&self` | Output: `true`.
     fn supports_window_mode(&self) -> bool {
         true
     }
 
+    /// Captura a tela inteira X11 em uma thread bloqueante dedicada.
+    /// Input: `&self` | Output: `PlatformFuture` resolvendo em `CapturedImage`.
     fn capture_desktop(&self) -> PlatformFuture<'_, CapturedImage> {
         Box::pin(async move {
             tokio::task::spawn_blocking(capture_x11_desktop_blocking)
@@ -51,6 +61,8 @@ impl CaptureBackend for X11CaptureBackend {
         })
     }
 
+    /// Captura a tela cheia X11 para permitir o recorte pela janela escolhida no overlay.
+    /// Input: `&self` | Output: `PlatformFuture` resolvendo em `CapturedImage`.
     fn capture_window(&self) -> PlatformFuture<'_, CapturedImage> {
         // On X11, window selection happens inside the freeze-frame overlay using `_NET_CLIENT_LIST`;
         // capture_window returns the full desktop with outputs so the overlay can crop to the selected window.
@@ -58,7 +70,8 @@ impl CaptureBackend for X11CaptureBackend {
     }
 }
 
-/// Enumerates visible top-level windows from `_NET_CLIENT_LIST` in root-window coordinates.
+/// Enumera janelas mapeadas e visíveis via `_NET_CLIENT_LIST` convertidas para coordenadas globais.
+/// Input: nenhum | Output: `Result<Vec<X11WindowBounds>, PlatformError>`.
 pub fn list_x11_windows() -> Result<Vec<X11WindowBounds>, PlatformError> {
     let (conn, screen_num) = RustConnection::connect(None)
         .map_err(|e| PlatformError::CaptureFailed(format!("X11 connect failed: {e}")))?;
@@ -116,6 +129,8 @@ pub fn list_x11_windows() -> Result<Vec<X11WindowBounds>, PlatformError> {
     Ok(windows)
 }
 
+/// Consulta ou cria o identificador numérico de um átomo X11.
+/// Input: conexão `conn` e nome `name` | Output: `Result<u32, PlatformError>`.
 fn intern_atom(conn: &RustConnection, name: &[u8]) -> Result<u32, PlatformError> {
     conn.intern_atom(false, name)
         .map_err(|e| PlatformError::CaptureFailed(format!("intern_atom failed: {e}")))?
@@ -124,6 +139,8 @@ fn intern_atom(conn: &RustConnection, name: &[u8]) -> Result<u32, PlatformError>
         .map_err(|e| PlatformError::CaptureFailed(format!("intern_atom reply failed: {e}")))
 }
 
+/// Captura toda a janela raiz X11 em modo bloqueante usando XShm com fallback para `GetImage`.
+/// Input: nenhum | Output: `Result<CapturedImage, PlatformError>`.
 fn capture_x11_desktop_blocking() -> Result<CapturedImage, PlatformError> {
     let (conn, screen_num) = RustConnection::connect(None)
         .map_err(|e| PlatformError::CaptureFailed(format!("X11 connect failed: {e}")))?;
@@ -158,6 +175,8 @@ fn capture_x11_desktop_blocking() -> Result<CapturedImage, PlatformError> {
     })
 }
 
+/// Captura pixels BGRA da janela raiz utilizando memória compartilhada `MIT-SHM`.
+/// Input: conexão `conn`, janela `root`, `width` e `height` | Output: `Result<Vec<u8>, PlatformError>`.
 fn capture_via_shm(
     conn: &RustConnection,
     root: Window,
@@ -240,6 +259,8 @@ fn capture_via_shm(
     Ok(buf)
 }
 
+/// Realiza captura de fallback via chamada X11 padrão `GetImage` quando XShm falha.
+/// Input: conexão `conn`, janela `root`, `width` e `height` | Output: `Result<Vec<u8>, PlatformError>`.
 fn capture_via_get_image(
     conn: &RustConnection,
     root: Window,
@@ -255,6 +276,8 @@ fn capture_via_get_image(
     Ok(reply.data)
 }
 
+/// Converte pixels BGRx do X11 em RGBA8 opaco descartando lixo no canal alfa.
+/// Input: slice `bgra` bruto | Output: `Vec<u8>` em RGBA8 reto.
 fn swizzle_bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(bgra.len());
     for px in bgra.as_chunks::<4>().0 {
@@ -266,6 +289,8 @@ fn swizzle_bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     rgba
 }
 
+/// Consulta monitores conectados e seus limites CRTC ativos usando a extensão X11 RandR.
+/// Input: conexão `conn` e janela `root` | Output: `Result<Vec<OutputGeometry>, PlatformError>`.
 fn query_randr_outputs(
     conn: &RustConnection,
     root: Window,
@@ -313,6 +338,8 @@ fn query_randr_outputs(
     Ok(outputs)
 }
 
+/// Cria geometria virtual única cobrindo toda a tela quando RandR não retorna saídas válidas.
+/// Input: `width` e `height` totais da tela | Output: instância única de `OutputGeometry`.
 fn fallback_output(width: u32, height: u32) -> OutputGeometry {
     OutputGeometry {
         name: "x11-0".to_string(),

@@ -1,4 +1,7 @@
-//! Post-copy clipboard holder for Wayland (`wl-clipboard-rs`) and X11/XWayland (`x11rb`).
+//! Módulo: `clipboard`
+//! Objetivos: Manter a posse da imagem PNG na área de transferência no Wayland (`wl-clipboard-rs`) e no X11/XWayland (`x11rb`) após fechar a UI.
+//! Principais itens: `WaylandClipboardBackend`, `X11ClipboardBackend`, `AutoClipboardBackend`, `copy_wayland_blocking` e `copy_x11_blocking`.
+//! Última alteração: 2026-11-19
 
 use lx_snip_core::platform::{ClipboardBackend, PlatformError, PlatformFuture};
 use tracing::{debug, info, warn};
@@ -11,11 +14,14 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
-/// Wayland clipboard holder backed by `wl-clipboard-rs` (`wlr-data-control` / `ext-data-control-v1`).
+/// Implementa o backend de clipboard para compositores Wayland com suporte a `data-control`.
+/// Armazena: estrutura unitária sem campos | Principais métodos: `copy_png_and_hold`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WaylandClipboardBackend;
 
 impl ClipboardBackend for WaylandClipboardBackend {
+    /// Publica `png_bytes` via `wl-clipboard-rs` em thread bloqueante até a posse mudar.
+    /// Input: `&self` e `png_bytes` | Output: `PlatformFuture` indicando conclusão ou erro.
     fn copy_png_and_hold(&self, png_bytes: Vec<u8>) -> PlatformFuture<'_, ()> {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || copy_wayland_blocking(png_bytes))
@@ -27,11 +33,14 @@ impl ClipboardBackend for WaylandClipboardBackend {
     }
 }
 
-/// X11 / XWayland clipboard holder backed by `x11rb` selection ownership.
+/// Implementa o backend de clipboard X11/XWayland segurando a seleção `CLIPBOARD` via `x11rb`.
+/// Armazena: estrutura unitária sem campos | Principais métodos: `copy_png_and_hold`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct X11ClipboardBackend;
 
 impl ClipboardBackend for X11ClipboardBackend {
+    /// Publica `png_bytes` via servidor X11/XWayland em thread bloqueante até perder a seleção.
+    /// Input: `&self` e `png_bytes` | Output: `PlatformFuture` indicando conclusão ou erro.
     fn copy_png_and_hold(&self, png_bytes: Vec<u8>) -> PlatformFuture<'_, ()> {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || copy_x11_blocking(png_bytes))
@@ -43,19 +52,22 @@ impl ClipboardBackend for X11ClipboardBackend {
     }
 }
 
-/// Selects `wl-clipboard-rs` on `data-control`-capable Wayland compositors and falls back
-/// to `x11rb` X11/XWayland selection ownership on GNOME Wayland and X11.
+/// Escolhe automaticamente entre `WaylandClipboardBackend` e `X11ClipboardBackend` com fallback em GNOME.
+/// Armazena: estrutura unitária sem campos | Principais métodos: `new`, `copy_png_and_hold`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AutoClipboardBackend;
 
 impl AutoClipboardBackend {
-    /// Creates a new [`AutoClipboardBackend`].
+    /// Cria uma nova instância de `AutoClipboardBackend`.
+    /// Input: nenhum | Output: `AutoClipboardBackend`.
     pub const fn new() -> Self {
         Self
     }
 }
 
 impl ClipboardBackend for AutoClipboardBackend {
+    /// Publica `png_bytes` usando `wl-clipboard-rs` fora do GNOME ou fallback direto no X11/XWayland.
+    /// Input: `&self` e `png_bytes` | Output: `PlatformFuture` indicando sucesso ou erro.
     fn copy_png_and_hold(&self, png_bytes: Vec<u8>) -> PlatformFuture<'_, ()> {
         Box::pin(async move {
             if std::env::var_os("WAYLAND_DISPLAY").is_some() && !is_gnome_session() {
@@ -74,12 +86,16 @@ impl ClipboardBackend for AutoClipboardBackend {
     }
 }
 
+/// Verifica pelas variáveis de ambiente se a sessão atual é GNOME (onde falta `wlr-data-control`).
+/// Input: nenhum | Output: `true` se `XDG_CURRENT_DESKTOP` contém `GNOME`.
 fn is_gnome_session() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|d| d.to_ascii_uppercase().contains("GNOME"))
         .unwrap_or(false)
 }
 
+/// Serve `image/png` em primeiro plano via `wl-clipboard-rs` até outro aplicativo assumir o clipboard.
+/// Input: vetor `png_bytes` | Output: `Result<(), PlatformError>`.
 fn copy_wayland_blocking(png_bytes: Vec<u8>) -> Result<(), PlatformError> {
     let mut opts = Options::new();
     opts.foreground(true);
@@ -92,6 +108,8 @@ fn copy_wayland_blocking(png_bytes: Vec<u8>) -> Result<(), PlatformError> {
     Ok(())
 }
 
+/// Resolve ou registra o identificador numérico de um átomo X11 pelo nome.
+/// Input: conexão `conn` e nome em bytes `name` | Output: `Result<u32, PlatformError>` com o atom.
 fn intern_atom(conn: &RustConnection, name: &[u8]) -> Result<u32, PlatformError> {
     conn.intern_atom(false, name)
         .map_err(|e| PlatformError::ClipboardFailed(format!("intern_atom failed: {e}")))?
@@ -100,6 +118,8 @@ fn intern_atom(conn: &RustConnection, name: &[u8]) -> Result<u32, PlatformError>
         .map_err(|e| PlatformError::ClipboardFailed(format!("intern_atom reply failed: {e}")))
 }
 
+/// Cria uma janela X11 oculta, adquire `CLIPBOARD` e atende `SelectionRequest` até receber `SelectionClear`.
+/// Input: vetor `png_bytes` | Output: `Result<(), PlatformError>`.
 fn copy_x11_blocking(png_bytes: Vec<u8>) -> Result<(), PlatformError> {
     let (conn, screen_num) = RustConnection::connect(None)
         .map_err(|e| PlatformError::ClipboardFailed(format!("X11 connect failed: {e}")))?;

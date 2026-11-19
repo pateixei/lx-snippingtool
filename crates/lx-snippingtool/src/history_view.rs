@@ -1,4 +1,7 @@
-//! Snip history view displaying bounded `snips/` thumbnails with Copy, Edit, and Delete actions.
+//! Módulo: `history_view`
+//! Objetivos: Exibir o histórico local limitado de capturas PNG com miniaturas e ações de Copiar, Editar e Excluir.
+//! Principais itens: `HistoryMessage`, `HistoryAction`, `HistoryItem` e `HistoryState`.
+//! Última alteração: 2026-11-19
 
 use std::path::PathBuf;
 
@@ -6,43 +9,47 @@ use iced::widget::{button, column, container, image, row, scrollable, text, Colu
 use iced::{Alignment, Element, Length};
 use lx_snip_core::storage::{SnipEntry, SnipStore};
 
-/// Messages emitted by [`HistoryState`].
+/// Mensagens de interação emitidas pela janela de histórico de capturas.
+/// Armazena: variantes `Refresh`, `Copy`, `Edit` e `Delete` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone)]
 pub enum HistoryMessage {
-    /// Reload snip entries from disk.
+    /// Recarrega a lista de arquivos do disco.
     Refresh,
-    /// Copy the selected snip PNG bytes to the clipboard and exit UI.
+    /// Copia o PNG selecionado para a área de transferência e encerra a interface.
     Copy(PathBuf),
-    /// Open the selected snip in the annotation editor.
+    /// Abre a captura selecionada no editor de anotações.
     Edit(PathBuf),
-    /// Delete the selected snip from disk.
+    /// Remove do disco a captura selecionada.
     Delete(PathBuf),
 }
 
-/// External action requested by [`HistoryState::update`].
+/// Ações externas solicitadas ao controlador principal por `HistoryState::update`.
+/// Armazena: variantes `CopyPng` e `OpenEditor` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone)]
 pub enum HistoryAction {
-    /// Copy raw PNG bytes to clipboard and close UI.
+    /// Copia bytes PNG crus para o clipboard e fecha a janela.
     CopyPng {
-        /// Path to the snip file.
+        /// Caminho do arquivo de captura.
         path: PathBuf,
-        /// Raw PNG bytes.
+        /// Conteúdo bruto do PNG.
         png_bytes: Vec<u8>,
     },
-    /// Open the given snip file in the annotation editor.
+    /// Abre o arquivo informado no editor de anotações.
     OpenEditor(PathBuf),
 }
 
-/// Entry paired with an `iced::widget::image::Handle` thumbnail.
+/// Associa uma entrada do repositório em disco ao respectivo `image::Handle` de miniatura.
+/// Armazena: `entry` e `handle` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone)]
 pub struct HistoryItem {
-    /// Underlying storage entry.
+    /// Entrada subjacente no `SnipStore`.
     pub entry: SnipEntry,
-    /// Thumbnail handle for `iced::widget::image`.
+    /// Handle de imagem usado para exibir a miniatura no Iced.
     pub handle: image::Handle,
 }
 
-/// State of the Snip History window.
+/// Mantém o estado e a renderização da janela de histórico de capturas.
+/// Armazena: `store`, lista `items` e `status_text` | Principais métodos: `new`, `reload`, `update`, `view`.
 #[derive(Debug, Clone)]
 pub struct HistoryState {
     store: SnipStore,
@@ -51,7 +58,8 @@ pub struct HistoryState {
 }
 
 impl HistoryState {
-    /// Creates a new [`HistoryState`] backed by `store` and loads existing entries.
+    /// Cria um `HistoryState` conectado a `store` e já carrega os itens do disco.
+    /// Input: `store` do tipo `SnipStore` | Output: instância inicializada de `HistoryState`.
     pub fn new(store: SnipStore) -> Self {
         let mut state = Self {
             store,
@@ -62,7 +70,8 @@ impl HistoryState {
         state
     }
 
-    /// Reloads snip entries from `store`.
+    /// Releitura das capturas salvas em `store` para atualizar miniaturas e status.
+    /// Input: `&mut self` | Output: atualiza `self.items` e `self.status_text`.
     pub fn reload(&mut self) {
         match self.store.list() {
             Ok(entries) => {
@@ -82,7 +91,8 @@ impl HistoryState {
         }
     }
 
-    /// Updates history state and optionally returns a [`HistoryAction`].
+    /// Processa uma `HistoryMessage` e retorna uma `HistoryAction` quando exige ação da janela principal.
+    /// Input: `&mut self` e `msg` | Output: `Option<HistoryAction>`.
     pub fn update(&mut self, msg: HistoryMessage) -> Option<HistoryAction> {
         match msg {
             HistoryMessage::Refresh => {
@@ -108,16 +118,21 @@ impl HistoryState {
         }
     }
 
-    /// Renders the Snip History UI.
+    /// Constrói a árvore de widgets Iced da lista de histórico e seus botões de ação.
+    /// Input: `&self` | Output: `Element<'_, HistoryMessage>`.
     pub fn view(&self) -> Element<'_, HistoryMessage> {
-        let header = row![
-            text(format!("Snip History ({})", self.items.len())).size(18),
-            button(text("Refresh").size(13))
-                .padding([6, 12])
-                .on_press(HistoryMessage::Refresh),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
+        let header = container(
+            row![
+                text(format!("Snip History ({})", self.items.len())).size(18),
+                button(text("Refresh").size(13))
+                    .padding([6, 12])
+                    .on_press(HistoryMessage::Refresh),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .center_x(Length::Fill);
 
         let mut list_col = Column::new().spacing(10).width(Length::Fill);
         if self.items.is_empty() {
@@ -142,9 +157,7 @@ impl HistoryState {
                     .height(Length::Fixed(100.0))
                     .content_fit(iced::ContentFit::Contain);
 
-                let meta = column![
-                    text(name).size(14),
-                    text(format!("{kb:.1} KiB")).size(12),
+                let actions = container(
                     row![
                         button(text("Copy").size(12))
                             .padding([4, 10])
@@ -159,7 +172,16 @@ impl HistoryState {
                             .on_press(HistoryMessage::Delete(item.entry.path.clone())),
                     ]
                     .spacing(6),
+                )
+                .width(Length::Fill)
+                .center_x(Length::Fill);
+
+                let meta = column![
+                    text(name).size(14),
+                    text(format!("{kb:.1} KiB")).size(12),
+                    actions,
                 ]
+                .width(Length::Fill)
                 .spacing(6);
 
                 let card = container(row![thumb, meta].spacing(14).align_y(Alignment::Center))

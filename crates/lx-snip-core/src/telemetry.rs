@@ -1,4 +1,7 @@
-//! Structured `tracing` logging and panic hook initialization.
+//! Módulo: `telemetry`
+//! Objetivos: Inicializar logging estruturado (`tracing` no `stderr` e `journald`) e registrar hook global de panic.
+//! Principais itens: `init_telemetry` e `install_panic_hook`.
+//! Última alteração: 2026-11-19
 
 use std::backtrace::Backtrace;
 use std::sync::Once;
@@ -9,10 +12,8 @@ use tracing_subscriber::EnvFilter;
 
 static TELEMETRY_INIT: Once = Once::new();
 
-/// Initializes structured logging to `stderr` and `journald` (when available),
-/// and installs a panic hook that logs thread metadata and backtraces.
-///
-/// Safe to call multiple times; subsequent calls are no-ops.
+/// Inicializa o sistema de logs (`stderr` + `journald` quando disponível) e o hook de panic uma única vez.
+/// Input: nenhum | Output: nenhum (efeito colateral idempotente de inicialização global).
 pub fn init_telemetry() {
     TELEMETRY_INIT.call_once(|| {
         let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -38,6 +39,8 @@ pub fn init_telemetry() {
     });
 }
 
+/// Substitui o hook padrão de panic para registrar thread, localização e backtrace via `tracing::error`.
+/// Input: nenhum | Output: nenhum (instala o panic hook global).
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
