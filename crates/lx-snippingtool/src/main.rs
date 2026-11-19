@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use iced::keyboard;
-use iced::widget::{button, container, row, text, Column};
+use iced::widget::{button, container, mouse_area, row, text, Column};
 use iced::{Alignment, Element, Length, Size, Subscription, Task};
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
 use iced_layershell::settings::LayerShellSettings;
@@ -39,6 +39,7 @@ use crate::editor::{save_as_via_portal, EditorAction, EditorMessage, EditorState
 use crate::history_view::{HistoryAction, HistoryMessage, HistoryState};
 use crate::overlay::{OverlayMessage, OverlayOutcome, OverlayState};
 use crate::recorder::ActiveRecording;
+use crate::tray::{RecordingTray, TrayRecordingCmd};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliMode {
@@ -108,6 +109,22 @@ impl std::fmt::Debug for SharedRecording {
     }
 }
 
+#[derive(Clone)]
+struct RecordingSessionBundle {
+    recording: SharedRecording,
+    tray: Option<ksni::Handle<RecordingTray>>,
+    tray_rx:
+        Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<TrayRecordingCmd>>>>,
+}
+
+impl std::fmt::Debug for RecordingSessionBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingSessionBundle")
+            .field("has_tray", &self.tray.is_some())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, WindowInfoMarker)]
 enum WindowInfo {
     DelayPill,
@@ -133,6 +150,9 @@ enum AppPhase {
     StartingRecording,
     Recording {
         elapsed_secs: u64,
+        paused: bool,
+        busy: bool,
+        floating_bar_visible: bool,
     },
     RecordingDone {
         path: PathBuf,
@@ -152,8 +172,12 @@ enum AppMessage {
     Overlay(OverlayMessage),
     Editor(EditorMessage),
     History(HistoryMessage),
-    RecordingStarted(Result<SharedRecording, String>),
+    RecordingStarted(Result<RecordingSessionBundle, String>),
     RecordingTick,
+    TogglePauseRecording,
+    PauseToggled(Result<bool, String>),
+    TrayRecordingEvent(Option<TrayRecordingCmd>),
+    DragRecordingBar,
     StopRecording,
     RecordingStopped(Result<(PathBuf, u64), String>),
     SaveRecordingAs,
@@ -175,6 +199,9 @@ struct AppCore {
     is_wayland: bool,
     capture_lock: Option<File>,
     active_recording: Option<SharedRecording>,
+    recording_tray: Option<ksni::Handle<RecordingTray>>,
+    recording_tray_rx:
+        Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<TrayRecordingCmd>>>>,
 }
 
 impl AppCore {
@@ -201,6 +228,8 @@ impl AppCore {
             is_wayland,
             capture_lock,
             active_recording: None,
+            recording_tray: None,
+            recording_tray_rx: None,
         }
     }
 
@@ -260,23 +289,42 @@ impl AppCore {
             }
             AppMessage::Cancel => {
                 if matches!(self.phase, AppPhase::Recording { .. }) {
-                    self.stop_recording_task()
+                    // Do not abort active recordings when user hits Escape in another app.
+                    Task::none()
                 } else {
                     iced::exit()
                 }
             }
             AppMessage::WindowClosed(id) => {
                 self.windows.remove(&id);
-                if self.windows.is_empty() {
-                    if matches!(self.phase, AppPhase::Recording { .. }) {
-                        return self.stop_recording_task();
+                if matches!(self.phase, AppPhase::Recording { .. }) {
+                    let has_bar = self
+                        .windows
+                        .values()
+                        .any(|w| matches!(w, WindowInfo::RecordingBar));
+                    if !has_bar {
+                        if self.recording_tray.is_some() {
+                            if let AppPhase::Recording {
+                                floating_bar_visible,
+                                ..
+                            } = &mut self.phase
+                            {
+                                *floating_bar_visible = false;
+                            }
+                            return self.update_tray_task();
+                        } else if self.windows.is_empty() {
+                            return self.stop_recording_task();
+                        }
                     }
-                    if !matches!(
+                    return Task::none();
+                }
+                if self.windows.is_empty()
+                    && !matches!(
                         self.phase,
                         AppPhase::Capturing | AppPhase::StartingRecording
-                    ) {
-                        return iced::exit();
-                    }
+                    )
+                {
+                    return iced::exit();
                 }
                 Task::none()
             }
@@ -335,10 +383,14 @@ impl AppCore {
                         width,
                         height,
                     }) => self.handle_captured_rgba(rgba, width, height),
+                    Some(OverlayOutcome::CaptureWindowPortal) => {
+                        let close_old = self.close_all_windows_task();
+                        self.mode = CaptureMode::Window;
+                        self.phase = AppPhase::Capturing;
+                        Task::batch([close_old, start_capture_task(self.mode, self.is_wayland)])
+                    }
                     Some(OverlayOutcome::StartRecording {
-                        rect,
-                        full_width,
-                        full_height,
+                        target,
                         with_system_audio,
                         with_mic,
                     }) => {
@@ -348,15 +400,28 @@ impl AppCore {
                         let is_wayland = self.is_wayland;
                         let start_task = Task::perform(
                             async move {
-                                recorder::start_recording(
+                                let rec = recorder::start_recording(
                                     is_wayland,
-                                    Some((rect, full_width, full_height)),
+                                    target,
                                     with_system_audio,
                                     with_mic,
                                 )
-                                .await
-                                .map(|rec| {
-                                    SharedRecording(Arc::new(tokio::sync::Mutex::new(Some(rec))))
+                                .await?;
+                                let (tray, tray_rx) = match tray::spawn_recording_tray().await {
+                                    Ok((handle, rx)) => {
+                                        (Some(handle), Some(Arc::new(tokio::sync::Mutex::new(rx))))
+                                    }
+                                    Err(err) => {
+                                        warn!(error = %err, "recording top-bar tray unavailable; falling back to floating bar");
+                                        (None, None)
+                                    }
+                                };
+                                Ok(RecordingSessionBundle {
+                                    recording: SharedRecording(Arc::new(tokio::sync::Mutex::new(
+                                        Some(rec),
+                                    ))),
+                                    tray,
+                                    tray_rx,
                                 })
                             },
                             AppMessage::RecordingStarted,
@@ -496,18 +561,27 @@ impl AppCore {
                 }
             }
             AppMessage::RecordingStarted(res) => match res {
-                Ok(shared) => {
-                    self.active_recording = Some(shared);
-                    self.phase = AppPhase::Recording { elapsed_secs: 0 };
-                    let (id, open_task) = iced::window::open(iced::window::Settings {
-                        size: Size::new(220.0, 52.0),
-                        decorations: false,
-                        resizable: false,
-                        level: iced::window::Level::AlwaysOnTop,
-                        ..Default::default()
-                    });
-                    self.windows.insert(id, WindowInfo::RecordingBar);
-                    Task::batch([open_task.discard(), schedule_recording_tick()])
+                Ok(bundle) => {
+                    let has_tray = bundle.tray.is_some();
+                    self.active_recording = Some(bundle.recording);
+                    self.recording_tray = bundle.tray;
+                    self.recording_tray_rx = bundle.tray_rx.clone();
+                    let floating_bar_visible = !has_tray;
+                    self.phase = AppPhase::Recording {
+                        elapsed_secs: 0,
+                        paused: false,
+                        busy: false,
+                        floating_bar_visible,
+                    };
+
+                    let mut tasks = vec![schedule_recording_tick()];
+                    if let Some(rx) = bundle.tray_rx {
+                        tasks.push(listen_tray_cmd(rx));
+                    }
+                    if floating_bar_visible {
+                        tasks.push(self.open_recording_bar_window());
+                    }
+                    Task::batch(tasks)
                 }
                 Err(err) => {
                     warn!(error = %err, "recording failed to start");
@@ -525,11 +599,87 @@ impl AppCore {
                 }
             },
             AppMessage::RecordingTick => {
-                if let AppPhase::Recording { elapsed_secs } = &mut self.phase {
-                    *elapsed_secs += 1;
-                    return schedule_recording_tick();
+                if let AppPhase::Recording {
+                    elapsed_secs,
+                    paused,
+                    busy,
+                    ..
+                } = &mut self.phase
+                {
+                    if !*paused && !*busy {
+                        *elapsed_secs += 1;
+                    }
+                    return Task::batch([schedule_recording_tick(), self.update_tray_task()]);
                 }
                 Task::none()
+            }
+            AppMessage::TogglePauseRecording => self.toggle_pause_task(),
+            AppMessage::PauseToggled(res) => match res {
+                Ok(now_paused) => {
+                    if let AppPhase::Recording { paused, busy, .. } = &mut self.phase {
+                        *paused = now_paused;
+                        *busy = false;
+                    }
+                    self.update_tray_task()
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to toggle recording pause");
+                    if let AppPhase::Recording { busy, .. } = &mut self.phase {
+                        *busy = false;
+                    }
+                    Task::none()
+                }
+            },
+            AppMessage::TrayRecordingEvent(Some(cmd)) => {
+                if !matches!(self.phase, AppPhase::Recording { .. }) {
+                    return Task::none();
+                }
+                match cmd {
+                    TrayRecordingCmd::TogglePause => {
+                        let pause_task = self.toggle_pause_task();
+                        if let Some(rx) = self.recording_tray_rx.clone() {
+                            Task::batch([pause_task, listen_tray_cmd(rx)])
+                        } else {
+                            pause_task
+                        }
+                    }
+                    TrayRecordingCmd::Stop => self.stop_recording_task(),
+                    TrayRecordingCmd::ToggleFloatingBar => {
+                        let mut tasks = Vec::new();
+                        let show = match &mut self.phase {
+                            AppPhase::Recording {
+                                floating_bar_visible,
+                                ..
+                            } => {
+                                *floating_bar_visible = !*floating_bar_visible;
+                                *floating_bar_visible
+                            }
+                            _ => false,
+                        };
+                        if show {
+                            tasks.push(self.open_recording_bar_window());
+                        } else {
+                            tasks.push(self.close_recording_bar_windows());
+                        }
+                        tasks.push(self.update_tray_task());
+                        if let Some(rx) = self.recording_tray_rx.clone() {
+                            tasks.push(listen_tray_cmd(rx));
+                        }
+                        Task::batch(tasks)
+                    }
+                }
+            }
+            AppMessage::TrayRecordingEvent(None) => Task::none(),
+            AppMessage::DragRecordingBar => {
+                if let Some((&id, _)) = self
+                    .windows
+                    .iter()
+                    .find(|(_, info)| matches!(info, WindowInfo::RecordingBar))
+                {
+                    iced::window::drag(id)
+                } else {
+                    Task::none()
+                }
             }
             AppMessage::StopRecording => self.stop_recording_task(),
             AppMessage::RecordingStopped(res) => {
@@ -598,12 +748,118 @@ impl AppCore {
         }
     }
 
-    fn stop_recording_task(&mut self) -> Task<AppMessage> {
-        let Some(shared) = self.active_recording.take() else {
-            return iced::exit();
+    fn open_recording_bar_window(&mut self) -> Task<AppMessage> {
+        if self
+            .windows
+            .values()
+            .any(|info| matches!(info, WindowInfo::RecordingBar))
+        {
+            return Task::none();
+        }
+        let (id, open_task) = iced::window::open(iced::window::Settings {
+            size: Size::new(310.0, 54.0),
+            decorations: false,
+            resizable: false,
+            level: iced::window::Level::AlwaysOnTop,
+            ..Default::default()
+        });
+        self.windows.insert(id, WindowInfo::RecordingBar);
+        open_task.discard()
+    }
+
+    fn close_recording_bar_windows(&mut self) -> Task<AppMessage> {
+        let bar_ids: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|(_, info)| matches!(info, WindowInfo::RecordingBar))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in &bar_ids {
+            self.windows.remove(id);
+        }
+        Task::batch(bar_ids.into_iter().map(iced::window::close))
+    }
+
+    fn update_tray_task(&self) -> Task<AppMessage> {
+        let Some(tray) = self.recording_tray.clone() else {
+            return Task::none();
+        };
+        let AppPhase::Recording {
+            elapsed_secs,
+            paused,
+            floating_bar_visible,
+            ..
+        } = self.phase
+        else {
+            return Task::none();
+        };
+        Task::future(async move {
+            tray.update(|t| {
+                t.elapsed_secs = elapsed_secs;
+                t.paused = paused;
+                t.floating_bar_visible = floating_bar_visible;
+            })
+            .await;
+        })
+        .discard()
+    }
+
+    fn toggle_pause_task(&mut self) -> Task<AppMessage> {
+        let Some(shared) = self.active_recording.clone() else {
+            return Task::none();
+        };
+        let target_paused = match &mut self.phase {
+            AppPhase::Recording { paused, busy, .. } => {
+                if *busy {
+                    return Task::none();
+                }
+                *busy = true;
+                !*paused
+            }
+            _ => return Task::none(),
         };
         Task::perform(
             async move {
+                let mut guard = shared.0.lock().await;
+                let Some(rec) = guard.as_mut() else {
+                    return Err("Recording is no longer active".to_string());
+                };
+                if target_paused {
+                    rec.pause().await?;
+                } else {
+                    rec.resume().await?;
+                }
+                Ok(target_paused)
+            },
+            AppMessage::PauseToggled,
+        )
+    }
+
+    fn stop_recording_task(&mut self) -> Task<AppMessage> {
+        if let AppPhase::Recording { busy, .. } = &mut self.phase {
+            *busy = true;
+        }
+        let tray = self.recording_tray.take();
+        self.recording_tray_rx = None;
+        let close_bars = self.close_recording_bar_windows();
+        let Some(shared) = self.active_recording.take() else {
+            if let Some(handle) = tray {
+                return Task::batch([
+                    close_bars,
+                    Task::future(async move {
+                        handle.shutdown().await;
+                    })
+                    .discard(),
+                    iced::exit(),
+                ]);
+            }
+            return iced::exit();
+        };
+        let stop_task = Task::perform(
+            async move {
+                if let Some(handle) = tray {
+                    handle.shutdown().await;
+                }
                 let mut guard = shared.0.lock().await;
                 let Some(rec) = guard.take() else {
                     return Err("Recording already stopped".to_string());
@@ -612,7 +868,8 @@ impl AppCore {
                 rec.stop().await
             },
             AppMessage::RecordingStopped,
-        )
+        );
+        Task::batch([close_bars, stop_task])
     }
 
     fn handle_captured_rgba(&mut self, rgba: Vec<u8>, width: u32, height: u32) -> Task<AppMessage> {
@@ -739,26 +996,76 @@ impl AppCore {
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into(),
-            AppPhase::Recording { elapsed_secs } => {
+            AppPhase::Recording {
+                elapsed_secs,
+                paused,
+                busy,
+                ..
+            } => {
                 let mins = elapsed_secs / 60;
                 let secs = elapsed_secs % 60;
+                let dot_color = if *paused {
+                    iced::Color::from_rgb8(245, 158, 11)
+                } else {
+                    iced::Color::from_rgb8(220, 38, 38)
+                };
                 let dot = container(text(" ").size(8))
                     .width(Length::Fixed(10.0))
                     .height(Length::Fixed(10.0))
-                    .style(|_theme| container::Style {
-                        background: Some(iced::Background::Color(iced::Color::from_rgb8(
-                            220, 38, 38,
-                        ))),
+                    .style(move |_theme| container::Style {
+                        background: Some(iced::Background::Color(dot_color)),
                         border: iced::Border {
                             radius: 5.0.into(),
                             ..Default::default()
                         },
                         ..Default::default()
                     });
-                let stop_btn = button(
+
+                let timer_drag = mouse_area(
+                    row![dot, text(format!("{mins:02}:{secs:02}")).size(15)]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                )
+                .on_press(AppMessage::DragRecordingBar);
+
+                let (pause_icon, pause_label) = if *paused {
+                    (icons::ICON_PLAY, "Retomar")
+                } else {
+                    (icons::ICON_PAUSE, "Pausar")
+                };
+                let mut pause_btn = button(
+                    row![
+                        icons::icon(pause_icon, 14.0, iced::Color::WHITE),
+                        text(pause_label).size(13),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([6, 12])
+                .style(|_theme, status| {
+                    let bg = match status {
+                        button::Status::Hovered => iced::Color::from_rgb8(72, 72, 82),
+                        button::Status::Pressed => iced::Color::from_rgb8(86, 86, 98),
+                        _ => iced::Color::from_rgb8(54, 54, 62),
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        text_color: iced::Color::WHITE,
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                });
+                if !*busy {
+                    pause_btn = pause_btn.on_press(AppMessage::TogglePauseRecording);
+                }
+
+                let mut stop_btn = button(
                     row![
                         icons::icon(icons::ICON_STOP, 14.0, iced::Color::WHITE),
-                        text("Stop").size(13),
+                        text("Parar").size(13),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -779,11 +1086,13 @@ impl AppCore {
                         },
                         ..Default::default()
                     }
-                })
-                .on_press(AppMessage::StopRecording);
+                });
+                if !*busy {
+                    stop_btn = stop_btn.on_press(AppMessage::StopRecording);
+                }
 
-                let bar = row![dot, text(format!("{mins:02}:{secs:02}")).size(15), stop_btn,]
-                    .spacing(12)
+                let bar = row![timer_drag, pause_btn, stop_btn]
+                    .spacing(10)
                     .align_y(Alignment::Center);
 
                 container(bar)
@@ -875,6 +1184,18 @@ fn schedule_recording_tick() -> Task<AppMessage> {
             tokio::time::sleep(Duration::from_secs(1)).await;
         },
         |()| AppMessage::RecordingTick,
+    )
+}
+
+fn listen_tray_cmd(
+    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<TrayRecordingCmd>>>,
+) -> Task<AppMessage> {
+    Task::perform(
+        async move {
+            let mut guard = rx.lock().await;
+            guard.recv().await
+        },
+        AppMessage::TrayRecordingEvent,
     )
 }
 

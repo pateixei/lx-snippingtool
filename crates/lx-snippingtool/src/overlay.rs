@@ -3,7 +3,7 @@
 
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
-use iced::widget::{button, container, image, row, stack, text, tooltip, Column, Container};
+use iced::widget::{button, container, image, row, stack, text, Column, Container};
 use iced::{event, Alignment, Color, Element, Length, Point as IcedPoint, Rectangle, Size};
 use lx_snip_core::config::CaptureMode;
 use lx_snip_core::platform::{CapturedImage, OutputGeometry};
@@ -12,12 +12,28 @@ use tiny_skia::{FillRule, Mask, PathBuilder, Transform};
 
 use crate::capture_x11::X11WindowBounds;
 use crate::icons;
+use crate::recorder::RecordingTarget;
+
+/// Target selection inside Level 2 of the Record menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordTarget {
+    /// Record the whole desktop / monitor (default).
+    Fullscreen,
+    /// Drag a rectangle on screen and immediately start recording that region.
+    Rect,
+    /// Pick a single window to record.
+    Window,
+}
 
 /// Messages emitted by the freeze-frame overlay.
 #[derive(Debug, Clone)]
 pub enum OverlayMessage {
-    /// Switch active capture mode in the floating pill toolbar.
+    /// Switch active capture mode in the Level 1 floating pill toolbar.
     SelectMode(CaptureMode),
+    /// Select a Level 2 recording target (`Retângulo`, `Janela`, or `Fullscreen`).
+    SelectRecordTarget(RecordTarget),
+    /// Trigger the active Level 2 recording target immediately (`Iniciar gravação`).
+    StartRecordNow,
     /// Toggle system/desktop audio capture when recording.
     ToggleSystemAudio,
     /// Toggle microphone capture when recording.
@@ -30,7 +46,7 @@ pub enum OverlayMessage {
     PointerMove(Point),
     /// Pointer released at logical coordinates within the overlay.
     PointerUp(Point),
-    /// Immediately capture the full desktop.
+    /// Immediately capture the full desktop screenshot.
     ConfirmFullscreen,
     /// Cancel capture and close the overlay.
     Cancel,
@@ -48,14 +64,12 @@ pub enum OverlayOutcome {
         /// Height in pixels.
         height: u32,
     },
-    /// Region selected for Phase 2 screen recording.
+    /// User chose `Janela` on Wayland: close overlay and invoke the Wayland portal window picker.
+    CaptureWindowPortal,
+    /// Target selected for Phase 2 screen recording.
     StartRecording {
-        /// Selected rectangle in image-pixel coordinates.
-        rect: Rect,
-        /// Full captured desktop width in pixels.
-        full_width: u32,
-        /// Full captured desktop height in pixels.
-        full_height: u32,
+        /// Recording target (`Fullscreen`, `Region`, or `Window`).
+        target: RecordingTarget,
         /// Whether system/desktop audio capture is enabled.
         with_system_audio: bool,
         /// Whether microphone audio capture is enabled.
@@ -72,7 +86,7 @@ pub struct OverlayState {
     pub captured: CapturedImage,
     /// Cached static background handle (`None` in live transparent mode).
     pub bg_handle: Option<image::Handle>,
-    /// Active selection mode.
+    /// Active selection mode (Level 1).
     pub mode: CaptureMode,
     /// Whether in-overlay window selection is supported (X11 `_NET_CLIENT_LIST`).
     pub supports_window_mode: bool,
@@ -88,6 +102,8 @@ pub struct OverlayState {
     pub lasso_points: Vec<Point>,
     /// Current delay setting displayed in the mode bar.
     pub delay_secs: u8,
+    /// Active Level 2 target when `mode == CaptureMode::Record`.
+    pub record_target: RecordTarget,
     /// Whether system/desktop audio capture is toggled on in Record mode.
     pub record_system_audio: bool,
     /// Whether microphone audio capture is toggled on in Record mode.
@@ -119,9 +135,18 @@ impl OverlayState {
             drag_current: None,
             lasso_points: Vec::new(),
             delay_secs,
+            record_target: RecordTarget::Fullscreen,
             record_system_audio: true,
             record_mic: false,
         }
+    }
+
+    fn start_recording_outcome(&self, target: RecordingTarget) -> Option<OverlayOutcome> {
+        Some(OverlayOutcome::StartRecording {
+            target,
+            with_system_audio: self.record_system_audio,
+            with_mic: self.record_mic,
+        })
     }
 
     /// Updates overlay state and returns an [`OverlayOutcome`] when the capture finishes or cancels.
@@ -129,17 +154,45 @@ impl OverlayState {
         match msg {
             OverlayMessage::SelectMode(mode) => {
                 if mode == CaptureMode::Window && !self.supports_window_mode {
-                    return None;
+                    return Some(OverlayOutcome::CaptureWindowPortal);
                 }
                 self.mode = mode;
                 self.drag_start = None;
                 self.drag_current = None;
                 self.lasso_points.clear();
                 self.hovered_window = None;
-                if mode == CaptureMode::Fullscreen {
+                if mode == CaptureMode::Record {
+                    self.record_target = RecordTarget::Fullscreen;
+                } else if mode == CaptureMode::Fullscreen {
                     return self.finish_fullscreen();
                 }
                 None
+            }
+            OverlayMessage::SelectRecordTarget(target) => {
+                self.mode = CaptureMode::Record;
+                self.record_target = target;
+                self.drag_start = None;
+                self.drag_current = None;
+                self.lasso_points.clear();
+                self.hovered_window = None;
+                match target {
+                    RecordTarget::Fullscreen => {
+                        self.start_recording_outcome(RecordingTarget::Fullscreen)
+                    }
+                    RecordTarget::Window if !self.supports_window_mode => {
+                        self.start_recording_outcome(RecordingTarget::Window)
+                    }
+                    RecordTarget::Rect | RecordTarget::Window => None,
+                }
+            }
+            OverlayMessage::StartRecordNow => {
+                let target =
+                    if self.record_target == RecordTarget::Window && !self.supports_window_mode {
+                        RecordingTarget::Window
+                    } else {
+                        RecordingTarget::Fullscreen
+                    };
+                self.start_recording_outcome(target)
             }
             OverlayMessage::ToggleSystemAudio => {
                 self.record_system_audio = !self.record_system_audio;
@@ -155,10 +208,26 @@ impl OverlayState {
             }
             OverlayMessage::PointerDown(pt) => {
                 match self.mode {
-                    CaptureMode::Rect | CaptureMode::Record => {
+                    CaptureMode::Rect => {
                         self.drag_start = Some(pt);
                         self.drag_current = Some(pt);
                     }
+                    CaptureMode::Record => match self.record_target {
+                        RecordTarget::Rect => {
+                            self.drag_start = Some(pt);
+                            self.drag_current = Some(pt);
+                        }
+                        RecordTarget::Window => {
+                            if let Some(win_rect) = self.find_window_at(pt) {
+                                return self.start_recording_outcome(RecordingTarget::Region {
+                                    rect: win_rect,
+                                    full_width: self.captured.width,
+                                    full_height: self.captured.height,
+                                });
+                            }
+                        }
+                        RecordTarget::Fullscreen => {}
+                    },
                     CaptureMode::Freeform => {
                         self.lasso_points.clear();
                         self.lasso_points.push(pt);
@@ -178,11 +247,22 @@ impl OverlayState {
             }
             OverlayMessage::PointerMove(pt) => {
                 match self.mode {
-                    CaptureMode::Rect | CaptureMode::Record => {
+                    CaptureMode::Rect => {
                         if self.drag_start.is_some() {
                             self.drag_current = Some(pt);
                         }
                     }
+                    CaptureMode::Record => match self.record_target {
+                        RecordTarget::Rect => {
+                            if self.drag_start.is_some() {
+                                self.drag_current = Some(pt);
+                            }
+                        }
+                        RecordTarget::Window => {
+                            self.hovered_window = self.find_window_at(pt);
+                        }
+                        RecordTarget::Fullscreen => {}
+                    },
                     CaptureMode::Freeform => {
                         if self.drag_start.is_some() {
                             self.drag_current = Some(pt);
@@ -203,24 +283,33 @@ impl OverlayState {
                 None
             }
             OverlayMessage::PointerUp(pt) => match self.mode {
-                CaptureMode::Rect | CaptureMode::Record => {
+                CaptureMode::Rect => {
                     let start = self.drag_start.take()?;
                     self.drag_current = None;
                     let rect = Rect::new(start.x, start.y, pt.x - start.x, pt.y - start.y)
                         .normalized()
                         .clamp(self.captured.width as f32, self.captured.height as f32);
                     if rect.width >= 4.0 && rect.height >= 4.0 {
-                        if self.mode == CaptureMode::Record {
-                            Some(OverlayOutcome::StartRecording {
-                                rect,
-                                full_width: self.captured.width,
-                                full_height: self.captured.height,
-                                with_system_audio: self.record_system_audio,
-                                with_mic: self.record_mic,
-                            })
-                        } else {
-                            self.finish_rect(rect, None)
-                        }
+                        self.finish_rect(rect, None)
+                    } else {
+                        None
+                    }
+                }
+                CaptureMode::Record => {
+                    if self.record_target != RecordTarget::Rect {
+                        return None;
+                    }
+                    let start = self.drag_start.take()?;
+                    self.drag_current = None;
+                    let rect = Rect::new(start.x, start.y, pt.x - start.x, pt.y - start.y)
+                        .normalized()
+                        .clamp(self.captured.width as f32, self.captured.height as f32);
+                    if rect.width >= 4.0 && rect.height >= 4.0 {
+                        self.start_recording_outcome(RecordingTarget::Region {
+                            rect,
+                            full_width: self.captured.width,
+                            full_height: self.captured.height,
+                        })
                     } else {
                         None
                     }
@@ -329,69 +418,36 @@ impl OverlayState {
     }
 
     fn view_mode_bar(&self) -> Element<'_, OverlayMessage> {
-        let rect_btn = mode_button(
+        let rect_btn = pill_icon_button(
             icons::ICON_RECT,
-            "Rect",
+            "Retângulo",
             self.mode == CaptureMode::Rect,
-            CaptureMode::Rect,
+            OverlayMessage::SelectMode(CaptureMode::Rect),
         );
-        let free_btn = mode_button(
+        let free_btn = pill_icon_button(
             icons::ICON_FREEFORM,
-            "Freeform",
+            "Livre",
             self.mode == CaptureMode::Freeform,
-            CaptureMode::Freeform,
+            OverlayMessage::SelectMode(CaptureMode::Freeform),
         );
-        let record_btn = mode_button(
+        let window_btn = pill_icon_button(
+            icons::ICON_WINDOW,
+            "Janela",
+            self.mode == CaptureMode::Window,
+            OverlayMessage::SelectMode(CaptureMode::Window),
+        );
+        let full_btn = pill_icon_button(
+            icons::ICON_FULLSCREEN,
+            "Fullscreen",
+            self.mode == CaptureMode::Fullscreen,
+            OverlayMessage::ConfirmFullscreen,
+        );
+        let record_btn = pill_icon_button(
             icons::ICON_RECORD,
-            "Record",
+            "Gravar tela",
             self.mode == CaptureMode::Record,
-            CaptureMode::Record,
+            OverlayMessage::SelectMode(CaptureMode::Record),
         );
-
-        let window_btn: Element<'_, OverlayMessage> = if self.supports_window_mode {
-            mode_button(
-                icons::ICON_WINDOW,
-                "Window",
-                self.mode == CaptureMode::Window,
-                CaptureMode::Window,
-            )
-            .into()
-        } else {
-            let disabled = button(
-                row![
-                    icons::icon(icons::ICON_WINDOW, 14.0, Color::from_rgb8(150, 150, 160)),
-                    text("Window")
-                        .size(13)
-                        .color(Color::from_rgb8(150, 150, 160)),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-            )
-            .padding([6, 12])
-            .style(overlay_pill_btn(false));
-            tooltip(
-                disabled,
-                container(
-                    text("Window capture uses the portal picker before freezing on Wayland (--mode window)")
-                        .size(12),
-                )
-                .padding(6),
-                tooltip::Position::Bottom,
-            )
-            .into()
-        };
-
-        let full_btn = button(
-            row![
-                icons::icon(icons::ICON_FULLSCREEN, 14.0, Color::from_rgb8(26, 26, 28)),
-                text("Fullscreen").size(13),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        )
-        .padding([6, 12])
-        .style(overlay_pill_btn(false))
-        .on_press(OverlayMessage::ConfirmFullscreen);
 
         let next_delay = match self.delay_secs {
             0 => 3,
@@ -425,10 +481,36 @@ impl OverlayState {
         .style(overlay_pill_btn(false))
         .on_press(OverlayMessage::Cancel);
 
-        let mut bar = row![rect_btn, free_btn, window_btn, full_btn, record_btn]
+        let level1 =
+            row![rect_btn, free_btn, window_btn, full_btn, record_btn, delay_btn, cancel_btn]
+                .spacing(6)
+                .align_y(Alignment::Center);
+
+        let mut col = Column::new()
+            .push(level1)
             .spacing(6)
-            .align_y(Alignment::Center);
+            .align_x(Alignment::Center);
+
         if self.mode == CaptureMode::Record {
+            let rec_rect_btn = pill_icon_button(
+                icons::ICON_RECT,
+                "Retângulo",
+                self.record_target == RecordTarget::Rect,
+                OverlayMessage::SelectRecordTarget(RecordTarget::Rect),
+            );
+            let rec_win_btn = pill_icon_button(
+                icons::ICON_WINDOW,
+                "Janela",
+                self.record_target == RecordTarget::Window,
+                OverlayMessage::SelectRecordTarget(RecordTarget::Window),
+            );
+            let rec_full_btn = pill_icon_button(
+                icons::ICON_FULLSCREEN,
+                "Fullscreen",
+                self.record_target == RecordTarget::Fullscreen,
+                OverlayMessage::SelectRecordTarget(RecordTarget::Fullscreen),
+            );
+
             let audio_label = if self.record_system_audio {
                 "Audio: On"
             } else {
@@ -438,6 +520,7 @@ impl OverlayState {
                 .padding([6, 12])
                 .style(overlay_pill_btn(self.record_system_audio))
                 .on_press(OverlayMessage::ToggleSystemAudio);
+
             let mic_label = if self.record_mic {
                 "Mic: On"
             } else {
@@ -447,12 +530,45 @@ impl OverlayState {
                 .padding([6, 12])
                 .style(overlay_pill_btn(self.record_mic))
                 .on_press(OverlayMessage::ToggleMic);
-            bar = bar.push(audio_btn).push(mic_btn);
-        }
-        let bar = bar.push(delay_btn).push(cancel_btn);
 
-        Container::new(Column::new().push(bar))
-            .padding([6, 10])
+            let start_rec_btn = button(
+                row![
+                    icons::icon(icons::ICON_RECORD, 14.0, Color::WHITE),
+                    text("Iniciar gravação").size(13),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 14])
+            .style(record_action_btn)
+            .on_press(OverlayMessage::StartRecordNow);
+
+            let level2 = row![
+                rec_rect_btn,
+                rec_win_btn,
+                rec_full_btn,
+                audio_btn,
+                mic_btn,
+                start_rec_btn,
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+
+            let hint = match self.record_target {
+                RecordTarget::Fullscreen => {
+                    "Padrão: Fullscreen — clique em Iniciar gravação ou escolha Retângulo / Janela"
+                }
+                RecordTarget::Rect => "Arraste um retângulo na tela para iniciar a gravação",
+                RecordTarget::Window => "Clique na janela desejada para iniciar a gravação",
+            };
+
+            col = col
+                .push(level2)
+                .push(text(hint).size(12).color(Color::from_rgb8(82, 82, 92)));
+        }
+
+        Container::new(col)
+            .padding([8, 12])
             .style(|_theme| container::Style {
                 background: Some(iced::Background::Color(Color::from_rgba8(
                     243, 243, 246, 0.96,
@@ -465,6 +581,23 @@ impl OverlayState {
                 ..Default::default()
             })
             .into()
+    }
+}
+
+fn record_action_btn(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Color::from_rgb8(185, 28, 28),
+        button::Status::Pressed => Color::from_rgb8(153, 27, 27),
+        _ => Color::from_rgb8(220, 38, 38),
+    };
+    button::Style {
+        background: Some(iced::Background::Color(bg)),
+        text_color: Color::WHITE,
+        border: iced::Border {
+            radius: 6.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -498,11 +631,11 @@ fn overlay_pill_btn(active: bool) -> impl Fn(&iced::Theme, button::Status) -> bu
     }
 }
 
-fn mode_button<'a>(
+fn pill_icon_button<'a>(
     svg_bytes: &'static [u8],
     label: &'a str,
     active: bool,
-    mode: CaptureMode,
+    msg: OverlayMessage,
 ) -> button::Button<'a, OverlayMessage> {
     let icon_color = if active {
         Color::WHITE
@@ -519,7 +652,7 @@ fn mode_button<'a>(
     )
     .padding([6, 12])
     .style(overlay_pill_btn(active))
-    .on_press(OverlayMessage::SelectMode(mode))
+    .on_press(msg)
 }
 
 struct OverlayCanvas<'a> {
@@ -585,7 +718,10 @@ impl<'a> canvas::Program<OverlayMessage> for OverlayCanvas<'a> {
                 )
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                if *is_dragging || self.state.mode == CaptureMode::Window {
+                let hover_window = self.state.mode == CaptureMode::Window
+                    || (self.state.mode == CaptureMode::Record
+                        && self.state.record_target == RecordTarget::Window);
+                if *is_dragging || hover_window {
                     (
                         event::Status::Captured,
                         Some(OverlayMessage::PointerMove(img_pt)),
@@ -620,7 +756,9 @@ impl<'a> canvas::Program<OverlayMessage> for OverlayCanvas<'a> {
         let mut frame = Frame::new(renderer, bounds.size());
         let dim = Color::from_rgba(0.0, 0.0, 0.0, 0.38);
 
-        let has_rect = matches!(self.state.mode, CaptureMode::Rect | CaptureMode::Record)
+        let has_rect = (self.state.mode == CaptureMode::Rect
+            || (self.state.mode == CaptureMode::Record
+                && self.state.record_target == RecordTarget::Rect))
             && self.state.drag_start.is_some()
             && self.state.drag_current.is_some();
 
@@ -633,83 +771,97 @@ impl<'a> canvas::Program<OverlayMessage> for OverlayCanvas<'a> {
             );
         }
 
-        match self.state.mode {
-            CaptureMode::Rect | CaptureMode::Record => {
-                if let (Some(start), Some(cur)) = (self.state.drag_start, self.state.drag_current) {
-                    let a = self.to_canvas_point(bounds, start);
-                    let b = self.to_canvas_point(bounds, cur);
-                    let x = a.x.min(b.x).clamp(0.0, bounds.width);
-                    let y = a.y.min(b.y).clamp(0.0, bounds.height);
-                    let x2 = a.x.max(b.x).clamp(0.0, bounds.width);
-                    let y2 = a.y.max(b.y).clamp(0.0, bounds.height);
-                    let w = (x2 - x).max(0.0);
-                    let h = (y2 - y).max(0.0);
+        let draw_rect_selection = self.state.mode == CaptureMode::Rect
+            || (self.state.mode == CaptureMode::Record
+                && self.state.record_target == RecordTarget::Rect);
 
-                    if y > 0.0 {
-                        frame.fill_rectangle(IcedPoint::ORIGIN, Size::new(bounds.width, y), dim);
-                    }
-                    if y2 < bounds.height {
-                        frame.fill_rectangle(
-                            IcedPoint::new(0.0, y2),
-                            Size::new(bounds.width, bounds.height - y2),
-                            dim,
-                        );
-                    }
-                    if x > 0.0 && h > 0.0 {
-                        frame.fill_rectangle(IcedPoint::new(0.0, y), Size::new(x, h), dim);
-                    }
-                    if x2 < bounds.width && h > 0.0 {
-                        frame.fill_rectangle(
-                            IcedPoint::new(x2, y),
-                            Size::new(bounds.width - x2, h),
-                            dim,
-                        );
-                    }
+        if draw_rect_selection {
+            if let (Some(start), Some(cur)) = (self.state.drag_start, self.state.drag_current) {
+                let a = self.to_canvas_point(bounds, start);
+                let b = self.to_canvas_point(bounds, cur);
+                let x = a.x.min(b.x).clamp(0.0, bounds.width);
+                let y = a.y.min(b.y).clamp(0.0, bounds.height);
+                let x2 = a.x.max(b.x).clamp(0.0, bounds.width);
+                let y2 = a.y.max(b.y).clamp(0.0, bounds.height);
+                let w = (x2 - x).max(0.0);
+                let h = (y2 - y).max(0.0);
 
-                    let sel = Path::rectangle(IcedPoint::new(x, y), Size::new(w, h));
-                    frame.stroke(
-                        &sel,
-                        Stroke::default()
-                            .with_color(Color::from_rgb8(96, 165, 250))
-                            .with_width(2.0),
+                if y > 0.0 {
+                    frame.fill_rectangle(IcedPoint::ORIGIN, Size::new(bounds.width, y), dim);
+                }
+                if y2 < bounds.height {
+                    frame.fill_rectangle(
+                        IcedPoint::new(0.0, y2),
+                        Size::new(bounds.width, bounds.height - y2),
+                        dim,
                     );
                 }
-            }
-            CaptureMode::Freeform => {
-                if self.state.lasso_points.len() >= 2 {
-                    let lasso_path = Path::new(|builder| {
-                        let first = self.to_canvas_point(bounds, self.state.lasso_points[0]);
-                        builder.move_to(first);
-                        for pt in &self.state.lasso_points[1..] {
-                            builder.line_to(self.to_canvas_point(bounds, *pt));
-                        }
-                    });
-                    frame.stroke(
-                        &lasso_path,
-                        Stroke::default()
-                            .with_color(Color::from_rgb8(96, 165, 250))
-                            .with_width(2.0),
+                if x > 0.0 && h > 0.0 {
+                    frame.fill_rectangle(IcedPoint::new(0.0, y), Size::new(x, h), dim);
+                }
+                if x2 < bounds.width && h > 0.0 {
+                    frame.fill_rectangle(
+                        IcedPoint::new(x2, y),
+                        Size::new(bounds.width - x2, h),
+                        dim,
                     );
                 }
+
+                let stroke_color = if self.state.mode == CaptureMode::Record {
+                    Color::from_rgb8(239, 68, 68)
+                } else {
+                    Color::from_rgb8(96, 165, 250)
+                };
+                let sel = Path::rectangle(IcedPoint::new(x, y), Size::new(w, h));
+                frame.stroke(
+                    &sel,
+                    Stroke::default().with_color(stroke_color).with_width(2.0),
+                );
             }
-            CaptureMode::Window => {
-                if let Some(win_rect) = self.state.hovered_window {
-                    let tl = self.to_canvas_point(bounds, Point::new(win_rect.x, win_rect.y));
-                    let br = self.to_canvas_point(
-                        bounds,
-                        Point::new(win_rect.x + win_rect.width, win_rect.y + win_rect.height),
-                    );
-                    let p = Path::rectangle(tl, Size::new(br.x - tl.x, br.y - tl.y));
-                    frame.fill(&p, Color::from_rgba8(96, 165, 250, 0.16));
-                    frame.stroke(
-                        &p,
-                        Stroke::default()
-                            .with_color(Color::from_rgb8(96, 165, 250))
-                            .with_width(2.5),
-                    );
-                }
+        } else if self.state.mode == CaptureMode::Freeform {
+            if self.state.lasso_points.len() >= 2 {
+                let lasso_path = Path::new(|builder| {
+                    let first = self.to_canvas_point(bounds, self.state.lasso_points[0]);
+                    builder.move_to(first);
+                    for pt in &self.state.lasso_points[1..] {
+                        builder.line_to(self.to_canvas_point(bounds, *pt));
+                    }
+                });
+                frame.stroke(
+                    &lasso_path,
+                    Stroke::default()
+                        .with_color(Color::from_rgb8(96, 165, 250))
+                        .with_width(2.0),
+                );
             }
-            CaptureMode::Fullscreen => {}
+        } else if self.state.mode == CaptureMode::Window
+            || (self.state.mode == CaptureMode::Record
+                && self.state.record_target == RecordTarget::Window)
+        {
+            if let Some(win_rect) = self.state.hovered_window {
+                let tl = self.to_canvas_point(bounds, Point::new(win_rect.x, win_rect.y));
+                let br = self.to_canvas_point(
+                    bounds,
+                    Point::new(win_rect.x + win_rect.width, win_rect.y + win_rect.height),
+                );
+                let p = Path::rectangle(tl, Size::new(br.x - tl.x, br.y - tl.y));
+                let (fill_color, stroke_color) = if self.state.mode == CaptureMode::Record {
+                    (
+                        Color::from_rgba8(239, 68, 68, 0.16),
+                        Color::from_rgb8(239, 68, 68),
+                    )
+                } else {
+                    (
+                        Color::from_rgba8(96, 165, 250, 0.16),
+                        Color::from_rgb8(96, 165, 250),
+                    )
+                };
+                frame.fill(&p, fill_color);
+                frame.stroke(
+                    &p,
+                    Stroke::default().with_color(stroke_color).with_width(2.5),
+                );
+            }
         }
 
         vec![frame.into_geometry()]
@@ -818,5 +970,67 @@ mod tests {
         let out_idx = 4;
         assert_eq!(cropped[out_idx], 255);
         assert_eq!(cropped[out_idx + 3], 255);
+    }
+
+    #[test]
+    fn record_level2_supports_default_fullscreen_rect_drag_and_wayland_window() {
+        let captured = CapturedImage {
+            rgba: vec![0u8; 200 * 100 * 4],
+            width: 200,
+            height: 100,
+            outputs: vec![],
+        };
+        let mut st = OverlayState::new(captured, CaptureMode::Rect, 0, false, vec![]);
+
+        // Level 1 -> Record opens Level 2 defaulting to Fullscreen (does not start immediately).
+        assert!(st
+            .update(OverlayMessage::SelectMode(CaptureMode::Record))
+            .is_none());
+        assert_eq!(st.mode, CaptureMode::Record);
+        assert_eq!(st.record_target, RecordTarget::Fullscreen);
+
+        // Stray click in default Fullscreen does not accidentally start recording.
+        assert!(st
+            .update(OverlayMessage::PointerDown(Point::new(10.0, 10.0)))
+            .is_none());
+
+        // "Iniciar gravação" starts Fullscreen immediately.
+        let outcome = st.update(OverlayMessage::StartRecordNow);
+        assert!(matches!(
+            outcome,
+            Some(OverlayOutcome::StartRecording {
+                target: RecordingTarget::Fullscreen,
+                ..
+            })
+        ));
+
+        // Selecting Retângulo in Level 2 lets the user drag a rect and immediately start.
+        assert!(st
+            .update(OverlayMessage::SelectRecordTarget(RecordTarget::Rect))
+            .is_none());
+        st.update(OverlayMessage::PointerDown(Point::new(20.0, 20.0)));
+        st.update(OverlayMessage::PointerMove(Point::new(100.0, 80.0)));
+        let drag_outcome = st.update(OverlayMessage::PointerUp(Point::new(100.0, 80.0)));
+        assert!(matches!(
+            drag_outcome,
+            Some(OverlayOutcome::StartRecording {
+                target: RecordingTarget::Region {
+                    full_width: 200,
+                    full_height: 100,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        // Selecting Janela in Level 2 on Wayland (!supports_window_mode) immediately triggers Window portal recording.
+        let win_outcome = st.update(OverlayMessage::SelectRecordTarget(RecordTarget::Window));
+        assert!(matches!(
+            win_outcome,
+            Some(OverlayOutcome::StartRecording {
+                target: RecordingTarget::Window,
+                ..
+            })
+        ));
     }
 }

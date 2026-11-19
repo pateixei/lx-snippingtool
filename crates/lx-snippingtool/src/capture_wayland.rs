@@ -81,6 +81,24 @@ async fn register_host_app() {
     }
 }
 
+/// Requested Wayland `ScreenCast` source kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaylandSource {
+    /// Capture an entire monitor.
+    Monitor,
+    /// Capture a single window chosen via the portal picker.
+    Window,
+}
+
+impl WaylandSource {
+    fn to_portal(self) -> SourceType {
+        match self {
+            Self::Monitor => SourceType::Monitor,
+            Self::Window => SourceType::Window,
+        }
+    }
+}
+
 /// Active Wayland `ScreenCast` session handle for live screen recording (Phase 2).
 pub struct WaylandScreencastSession {
     /// PipeWire remote fd to pass to `pipewiresrc`.
@@ -89,10 +107,23 @@ pub struct WaylandScreencastSession {
     pub node_id: u32,
     /// Whether a previously saved `restore_token` existed before starting this session.
     pub had_saved_token: bool,
+    proxy: Screencast<'static>,
     session: ashpd::desktop::Session<'static, Screencast<'static>>,
 }
 
 impl WaylandScreencastSession {
+    /// Re-opens the PipeWire remote fd on an existing `ScreenCast` session (used when resuming).
+    pub async fn reopen_pipewire_remote(&mut self) -> Result<(), PlatformError> {
+        self.pw_fd = self
+            .proxy
+            .open_pipe_wire_remote(&self.session)
+            .await
+            .map_err(|err| {
+                PlatformError::CaptureFailed(format!("failed to reopen PipeWire remote fd: {err}"))
+            })?;
+        Ok(())
+    }
+
     /// Closes the underlying D-Bus `ScreenCast` session so the compositor indicator stops.
     pub async fn close(self) {
         let _ = self.session.close().await;
@@ -169,13 +200,16 @@ async fn open_screencast_session_with_options(
         pw_fd,
         node_id,
         had_saved_token,
+        proxy,
         session,
     })
 }
 
-/// Opens a persistent `ScreenCast` stream (reusing `restore_token`) for video recording.
-pub async fn open_screencast_session() -> Result<WaylandScreencastSession, PlatformError> {
-    open_screencast_session_with_options(SourceType::Monitor, CursorMode::Embedded).await
+/// Opens a persistent `ScreenCast` stream (reusing `restore_token` for monitors) for video recording.
+pub async fn open_screencast_session_for(
+    source: WaylandSource,
+) -> Result<WaylandScreencastSession, PlatformError> {
+    open_screencast_session_with_options(source.to_portal(), CursorMode::Embedded).await
 }
 
 async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage, PlatformError> {
@@ -184,6 +218,7 @@ async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage
         node_id,
         had_saved_token,
         session,
+        ..
     } = open_screencast_session_with_options(source_type, CursorMode::Hidden).await?;
 
     let frame_res = tokio::task::spawn_blocking(move || {

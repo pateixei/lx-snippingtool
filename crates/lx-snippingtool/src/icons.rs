@@ -35,6 +35,8 @@ pub const ICON_COPY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 pub const ICON_HISTORY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.8 8a5.2 5.2 0 101.2-3.4M2.5 2.8v2.4h2.4M8 5.5V8l2 1.2"/></svg>"#;
 pub const ICON_RECORD: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2" y="4" width="8.5" height="8" rx="1.5"/><path d="M10.5 6.8l3.5-2v6.4l-3.5-2"/></svg>"#;
 pub const ICON_STOP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></svg>"#;
+pub const ICON_PAUSE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3.5" width="3" height="9" rx="1"/><rect x="9.5" y="3.5" width="3" height="9" rx="1"/></svg>"#;
+pub const ICON_PLAY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 3.2l8.5 4.8-8.5 4.8z"/></svg>"#;
 
 /// Renders a monochrome SVG icon tinted to `color`.
 pub fn icon<'a>(bytes: &'static [u8], size: f32, color: Color) -> svg::Svg<'a> {
