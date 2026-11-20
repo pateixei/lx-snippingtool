@@ -1,9 +1,18 @@
 //! Módulo: `main`
-//! Objetivos: Ponto de entrada do binário `lx-snippingtool`, gerenciando parsing de CLI, trava de instância única, despacho entre runners (`iced::daemon` e `iced_layershell`), integração com janelas nativas GTK4/Libadwaita, abertura automática de pasta salva e manutenção de clipboard na saída.
-//! Principais itens: `Cli`, `AppPhase`, `AppMessage`, `AppCore`, `IcedApp`, `LayerShellApp`, `open_saved_folder`, `main`
-//! Última alteração: 2026-11-19
+//! Objetivos: Ponto de entrada do binário `lx-snippingtool`, gerenciando parsing de CLI, trava de instância única, despacho entre runners (`iced::daemon` no X11/GNOME/Windows e `iced_layershell` no KDE/wlroots), integração opcional com GTK4/Libadwaita no Linux, bandeja/atalho global (`--tray`), abertura de pasta salva e manutenção de clipboard/notificação pós-saída.
+//! Principais itens: `Cli`, `AppPhase`, `AppMessage`, `AppCore`, `IcedApp`, `LayerShellApp` (Linux), `open_saved_folder` e `main`
+//! Última alteração: 2026-11-20
 
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
+#[cfg(target_os = "linux")]
 mod capture_wayland;
+#[cfg(target_os = "windows")]
+mod capture_windows;
+#[cfg(target_os = "linux")]
 mod capture_x11;
 mod clipboard;
 mod editor;
@@ -17,6 +26,7 @@ mod tray;
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+#[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -26,21 +36,36 @@ use clap::{Parser, ValueEnum};
 use iced::keyboard;
 use iced::widget::{button, container, row, text, Column};
 use iced::{Alignment, Element, Length, Size, Subscription, Task};
+#[cfg(target_os = "linux")]
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
+#[cfg(target_os = "linux")]
 use iced_layershell::settings::LayerShellSettings;
+#[cfg(target_os = "linux")]
 use iced_layershell::{to_layer_message, WindowInfoMarker};
 use lx_snip_core::config::{load_or_default, AppConfig, CaptureMode};
 use lx_snip_core::export::{encode_rgba, render_and_export, ExportFormat};
-use lx_snip_core::platform::{CaptureBackend, CapturedImage, ClipboardBackend, OutputGeometry};
+use lx_snip_core::platform::{
+    CaptureBackend, CapturedImage, ClipboardBackend, OutputGeometry, WindowBounds,
+};
 use lx_snip_core::scene::Point;
 use lx_snip_core::storage::SnipStore;
 use lx_snip_core::telemetry::init_telemetry;
 use tracing::{error, info, warn};
 
-use crate::capture_wayland::PortalCaptureBackend;
-use crate::capture_x11::{list_x11_windows, X11CaptureBackend, X11WindowBounds};
+#[cfg(target_os = "linux")]
+use crate::capture_wayland::{
+    capture_desktop_with_binding, PortalCaptureBackend, WaylandSourceBinding,
+};
+#[cfg(target_os = "linux")]
+use crate::capture_x11::{list_x11_windows, X11CaptureBackend};
+#[cfg(not(target_os = "linux"))]
+type WaylandSourceBinding = ();
+#[cfg(target_os = "windows")]
+use crate::capture_windows::{list_windows, WindowsCaptureBackend};
 use crate::clipboard::AutoClipboardBackend;
-use crate::editor::{save_as_via_portal, EditorAction, EditorMessage, EditorState, UiTheme};
+use crate::editor::{
+    pick_color_via_system, save_as_via_portal, EditorAction, EditorMessage, EditorState, UiTheme,
+};
 use crate::history_view::{HistoryAction, HistoryMessage, HistoryState};
 use crate::overlay::{OverlayMessage, OverlayOutcome, OverlayState};
 use crate::recorder::{ActiveRecording, PreparedRecording};
@@ -100,7 +125,7 @@ struct Cli {
     #[arg(long)]
     tray: bool,
 
-    /// Register Ctrl+Shift+S global shortcut in GNOME Settings (gsettings) and exit.
+    /// Register Ctrl+Shift+S global shortcut (gsettings on GNOME, Windows Run tray startup on Windows) and exit.
     #[arg(long)]
     install_shortcut: bool,
 }
@@ -160,8 +185,9 @@ impl std::fmt::Debug for RecordingSessionBundle {
 }
 
 /// Identificador lógico do papel de cada janela aberta pelos daemons `iced` ou `iced_layershell`.
-/// Armazena: variantes `DelayPill`, `Overlay`, `Editor`, `History`, `RecordingToast`, `RecordingBar`, `RecordingDone` e `Error` | Principais métodos: nenhum (marcador `WindowInfoMarker`)
-#[derive(Debug, Clone, PartialEq, Eq, WindowInfoMarker)]
+/// Armazena: variantes `DelayPill`, `Overlay`, `Editor`, `History`, `RecordingToast`, `RecordingBar`, `RecordingDone` e `Error` | Principais métodos: nenhum (marcador `WindowInfoMarker` no Linux).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_os = "linux", derive(WindowInfoMarker))]
 enum WindowInfo {
     DelayPill,
     Overlay(Option<OutputGeometryKey>),
@@ -221,7 +247,17 @@ enum AppMessage {
     DelayTick,
     NativeDelayCancelled,
     Cancel,
-    CaptureReady(Result<(CapturedImage, bool, Vec<X11WindowBounds>), String>),
+    CaptureReady(
+        Result<
+            (
+                CapturedImage,
+                bool,
+                Vec<WindowBounds>,
+                Option<WaylandSourceBinding>,
+            ),
+            String,
+        >,
+    ),
     Overlay(OverlayMessage),
     Editor(EditorMessage),
     History(HistoryMessage),
@@ -243,11 +279,12 @@ enum AppMessage {
     SaveRecordingDone(Result<Option<PathBuf>, String>),
     DiscardRecording,
     FinishExit,
+    ConfirmKey,
     WindowClosed(iced::window::Id),
 }
 
 /// Núcleo de estado e lógica compartilhado entre os daemons `IcedApp` e `LayerShellApp`.
-/// Armazena: `phase`, `mode`, `delay_secs`, `config`, `store`, `windows`, `outputs`, `pending_clipboard`, `is_wayland`, `system_dark`, `capture_lock`, `prepared_recording`, `active_recording`, `recording_tray`, `recording_tray_rx`, `native_delay`, `native_bar`, `native_bar_rx`, `native_done`, `native_done_rx`, `native_editor`, `native_editor_rx`, `native_history`, `native_history_rx` | Principais métodos: `new`, `initial_iced_task`, `update_core`, `view_core`, `open_editor_window`, `open_history_window`, `open_error_window`, `current_dark_theme`
+/// Armazena: `phase`, `mode`, `delay_secs`, `config`, `store`, `windows`, `outputs`, `wayland_binding`, `pending_clipboard`, `is_wayland`, `system_dark`, `capture_lock`, `prepared_recording`, `active_recording`, `recording_tray`, `recording_tray_rx`, `native_delay`, `native_bar`, `native_bar_rx`, `native_done`, `native_done_rx`, `native_editor`, `native_editor_rx`, `native_history`, `native_history_rx` | Principais métodos: `new`, `initial_iced_task`, `update_core`, `view_core`, `open_editor_window`, `open_history_window`, `open_error_window`, `current_dark_theme`
 struct AppCore {
     phase: AppPhase,
     mode: CaptureMode,
@@ -256,6 +293,7 @@ struct AppCore {
     store: SnipStore,
     windows: HashMap<iced::window::Id, WindowInfo>,
     outputs: Vec<OutputGeometry>,
+    wayland_binding: Option<WaylandSourceBinding>,
     pending_clipboard: Arc<Mutex<Option<ClipboardJob>>>,
     is_wayland: bool,
     system_dark: bool,
@@ -309,6 +347,7 @@ impl AppCore {
             store,
             windows: HashMap::new(),
             outputs: Vec::new(),
+            wayland_binding: None,
             pending_clipboard,
             is_wayland,
             system_dark,
@@ -420,6 +459,12 @@ impl AppCore {
                 Task::none()
             }
             AppMessage::Cancel => {
+                if let AppPhase::Editor(ed) = &mut self.phase {
+                    if !ed.curve_waypoints.is_empty() {
+                        ed.update(EditorMessage::CancelCurve);
+                        return Task::none();
+                    }
+                }
                 if matches!(self.phase, AppPhase::Recording { .. } | AppPhase::Exiting) {
                     // Do not abort active recordings or interrupt folder opening on Escape.
                     Task::none()
@@ -431,6 +476,14 @@ impl AppCore {
                     self.close_native_history();
                     self.discard_recording_task()
                 }
+            }
+            AppMessage::ConfirmKey => {
+                if let AppPhase::Editor(ed) = &mut self.phase {
+                    if !ed.curve_waypoints.is_empty() {
+                        ed.update(EditorMessage::FinishCurve);
+                    }
+                }
+                Task::none()
             }
             AppMessage::WindowClosed(id) => {
                 let closed_info = self.windows.remove(&id);
@@ -484,7 +537,8 @@ impl AppCore {
                 Task::none()
             }
             AppMessage::CaptureReady(res) => match res {
-                Ok((captured, supports_window, x11_windows)) => {
+                Ok((captured, supports_window, x11_windows, wayland_binding)) => {
+                    self.wayland_binding = wayland_binding;
                     if (self.mode == CaptureMode::Window && !supports_window)
                         || self.mode == CaptureMode::Fullscreen
                     {
@@ -548,6 +602,8 @@ impl AppCore {
                         let close_old = self.close_all_windows_task();
                         self.phase = AppPhase::StartingRecording;
                         let is_wayland = self.is_wayland;
+                        #[allow(clippy::clone_on_copy)]
+                        let wayland_binding = self.wayland_binding.clone();
                         let prepare_task = Task::perform(
                             async move {
                                 let rec = recorder::prepare_recording(
@@ -555,6 +611,7 @@ impl AppCore {
                                     target,
                                     with_system_audio,
                                     with_mic,
+                                    wayland_binding.as_ref(),
                                 )
                                 .await?;
                                 Ok(SharedPreparedRecording(Arc::new(tokio::sync::Mutex::new(
@@ -613,6 +670,12 @@ impl AppCore {
                             res
                         },
                         |res| AppMessage::Editor(EditorMessage::SaveCompleted(res)),
+                    ),
+                    Some(EditorAction::PickCustomColor { slot, initial }) => Task::perform(
+                        async move { (slot, pick_color_via_system(initial).await) },
+                        |(slot, col)| {
+                            AppMessage::Editor(EditorMessage::CustomColorPicked(slot, col))
+                        },
                     ),
                     None => Task::none(),
                 }
@@ -985,6 +1048,15 @@ impl AppCore {
                 } = &mut self.phase
                 {
                     if !*paused && !*busy {
+                        let exited = self.active_recording.as_ref().is_some_and(|shared| {
+                            shared.0.try_lock().is_ok_and(|g| {
+                                g.as_ref().is_some_and(ActiveRecording::has_child_exited)
+                            })
+                        });
+                        if exited {
+                            warn!("recording subprocess exited unexpectedly; finalizing recording");
+                            return self.stop_recording_task();
+                        }
                         *elapsed_secs += 1;
                     }
                     self.sync_recording_bar();
@@ -1472,7 +1544,7 @@ impl AppCore {
 
         self.phase = AppPhase::Editor(editor);
         let (id, open_task) = iced::window::open(iced::window::Settings {
-            size: Size::new(980.0, 680.0),
+            size: Size::new(1100.0, 720.0),
             decorations: true,
             ..Default::default()
         });
@@ -1661,26 +1733,32 @@ impl AppCore {
         Task::batch([close_bars, stop_task])
     }
 
-    /// Libera a trava de captura, salva/prepara a cópia automática da imagem RGBA8 e abre a janela do editor.
+    /// Libera a trava de captura, aplica políticas independentes de histórico/auto-cópia da captura original e abre o editor.
     /// Input: `&mut self`, `rgba` (`Vec<u8>`), `width` (`u32`), `height` (`u32`) | Output: `Task<AppMessage>` transicionando para `AppPhase::Editor`
     fn handle_captured_rgba(&mut self, rgba: Vec<u8>, width: u32, height: u32) -> Task<AppMessage> {
         // Capture overlay is finished; release single-instance capture lock so new captures can start.
         self.capture_lock = None;
-        if self.config.auto_copy {
+        if self.config.auto_copy || self.config.save_original_to_history {
             match encode_rgba(&rgba, width, height, ExportFormat::Png) {
                 Ok(png_bytes) => {
-                    let snip_path = match self.store.save_png(&png_bytes) {
-                        Ok(path) => path,
-                        Err(err) => {
-                            warn!(error = %err, "failed to save snip to local history; copying anyway");
-                            PathBuf::new()
+                    let snip_path = if self.config.save_original_to_history {
+                        match self.store.save_png(&png_bytes) {
+                            Ok(path) => path,
+                            Err(err) => {
+                                warn!(error = %err, "failed to save original snip to local history; copying anyway");
+                                PathBuf::new()
+                            }
                         }
+                    } else {
+                        PathBuf::new()
                     };
-                    if let Ok(mut guard) = self.pending_clipboard.lock() {
-                        *guard = Some(ClipboardJob {
-                            png_bytes,
-                            snip_path,
-                        });
+                    if self.config.auto_copy {
+                        if let Ok(mut guard) = self.pending_clipboard.lock() {
+                            *guard = Some(ClipboardJob {
+                                png_bytes,
+                                snip_path,
+                            });
+                        }
                     }
                 }
                 Err(err) => {
@@ -1711,12 +1789,31 @@ impl AppCore {
             ));
         } else {
             for out in &self.outputs {
+                #[cfg(target_os = "windows")]
+                let (win_x, win_y, win_w, win_h) = {
+                    let (vx, vy) = capture_windows::virtual_desktop_origin();
+                    let scale = if out.scale_factor > 0.0 {
+                        out.scale_factor as f32
+                    } else {
+                        1.0
+                    };
+                    (
+                        (vx + out.x) as f32 / scale,
+                        (vy + out.y) as f32 / scale,
+                        (out.width as f32) / scale,
+                        (out.height as f32) / scale,
+                    )
+                };
+                #[cfg(not(target_os = "windows"))]
+                let (win_x, win_y, win_w, win_h) = (
+                    out.x as f32,
+                    out.y as f32,
+                    out.width as f32,
+                    out.height as f32,
+                );
                 let (id, open_task) = iced::window::open(iced::window::Settings {
-                    position: iced::window::Position::Specific(iced::Point::new(
-                        out.x as f32,
-                        out.y as f32,
-                    )),
-                    size: Size::new(out.width as f32, out.height as f32),
+                    position: iced::window::Position::Specific(iced::Point::new(win_x, win_y)),
+                    size: Size::new(win_w, win_h),
                     decorations: false,
                     resizable: false,
                     level: iced::window::Level::AlwaysOnTop,
@@ -2119,6 +2216,7 @@ fn system_iced_theme(dark: bool) -> iced::Theme {
 
 /// Abre a pasta que contém `saved_file` no gerenciador de arquivos do sistema via portal `OpenDirectory` ou fallback `xdg-open`.
 /// Input: `saved_file` (`PathBuf`) | Output: `()`
+#[cfg(target_os = "linux")]
 async fn open_saved_folder(saved_file: PathBuf) {
     let opened_via_portal = match std::fs::File::open(&saved_file) {
         Ok(file) => match ashpd::desktop::open_uri::OpenDirectoryRequest::default()
@@ -2144,6 +2242,21 @@ async fn open_saved_folder(saved_file: PathBuf) {
         }
     }
 }
+
+/// Abre o Windows Explorer selecionando o arquivo de vídeo recém-salvo.
+/// Input: `saved_file` (`PathBuf`) | Output: `()`.
+#[cfg(target_os = "windows")]
+async fn open_saved_folder(saved_file: PathBuf) {
+    let arg = format!("/select,{}", saved_file.display());
+    if let Err(err) = std::process::Command::new("explorer.exe").arg(arg).spawn() {
+        warn!(error = %err, path = %saved_file.display(), "explorer.exe /select failed");
+    }
+}
+
+/// Fallback neutro de abertura de pasta fora do Linux e Windows.
+/// Input: `_saved_file` (`PathBuf`) | Output: `()`.
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+async fn open_saved_folder(_saved_file: PathBuf) {}
 
 /// Aguarda o próximo comando emitido pelo ícone SNI na bandeja do sistema e encaminha para o loop principal.
 /// Input: `rx` (`Arc<Mutex<UnboundedReceiver<TrayRecordingCmd>>>`) | Output: `Task<AppMessage>`
@@ -2246,6 +2359,7 @@ fn sync_history_to_native(
 
 /// Abre o diálogo nativo `SaveFileRequest` do portal XDG para copiar o vídeo gravado ao destino escolhido pelo usuário.
 /// Input: `src_path` (`PathBuf`), `default_dest` (`PathBuf`) | Output: `Result<Option<PathBuf>, String>`
+#[cfg(target_os = "linux")]
 async fn save_recording_via_portal(
     src_path: PathBuf,
     default_dest: PathBuf,
@@ -2291,27 +2405,145 @@ async fn save_recording_via_portal(
     Ok(Some(dest))
 }
 
-/// Executa a captura inicial da tela ou janela usando o backend apropriado (Wayland portal ou X11) em tarefa assíncrona.
+/// Abre o diálogo nativo `GetSaveFileNameW` no Windows 11 para copiar o vídeo MP4 gravado ao destino escolhido.
+/// Input: `src_path` (`PathBuf`), `default_dest` (`PathBuf`) | Output: `Result<Option<PathBuf>, String>`.
+#[cfg(target_os = "windows")]
+async fn save_recording_via_portal(
+    src_path: PathBuf,
+    default_dest: PathBuf,
+) -> Result<Option<PathBuf>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Option<PathBuf>, String> {
+        use windows::core::{HSTRING, PCWSTR, PWSTR};
+        use windows::Win32::UI::Controls::Dialogs::{
+            GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+            OPENFILENAMEW,
+        };
+
+        let filter: Vec<u16> = "MP4 Video (*.mp4)\0*.mp4\0\0".encode_utf16().collect();
+        let title = HSTRING::from("Salvar gravação de tela");
+        let def_ext = HSTRING::from("mp4");
+        let default_name = default_dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("gravacao.mp4");
+        let init_dir = default_dest.parent().map(|p| {
+            let _ = std::fs::create_dir_all(p);
+            HSTRING::from(p.to_string_lossy().as_ref())
+        });
+
+        let mut file_buf = vec![0u16; 1024];
+        for (i, ch) in default_name.encode_utf16().enumerate() {
+            file_buf[i] = ch;
+        }
+
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+            lpstrFilter: PCWSTR(filter.as_ptr()),
+            nFilterIndex: 1,
+            lpstrFile: PWSTR(file_buf.as_mut_ptr()),
+            nMaxFile: file_buf.len() as u32,
+            lpstrInitialDir: init_dir
+                .as_ref()
+                .map(|s| PCWSTR(s.as_ptr()))
+                .unwrap_or_else(PCWSTR::null),
+            lpstrTitle: PCWSTR(title.as_ptr()),
+            Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+            lpstrDefExt: PCWSTR(def_ext.as_ptr()),
+            ..Default::default()
+        };
+
+        if !unsafe { GetSaveFileNameW(&mut ofn) }.as_bool() {
+            return Ok(None);
+        }
+
+        let nul_pos = file_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(file_buf.len());
+        let mut dest = PathBuf::from(String::from_utf16_lossy(&file_buf[..nul_pos]));
+        if dest.extension().is_none() {
+            dest.set_extension("mp4");
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create save directory: {e}"))?;
+        }
+        std::fs::copy(&src_path, &dest).map_err(|e| format!("failed to copy recording: {e}"))?;
+        Ok(Some(dest))
+    })
+    .await
+    .map_err(|e| format!("Windows save recording task panicked: {e}"))?
+}
+
+/// Fallback neutro de gravação fora do Linux e Windows.
+/// Input: `_src_path`, `_default_dest` | Output: `Err` indicando ausência de suporte.
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+async fn save_recording_via_portal(
+    _src_path: PathBuf,
+    _default_dest: PathBuf,
+) -> Result<Option<PathBuf>, String> {
+    Err("Save recording dialog unsupported on this platform".to_string())
+}
+
+/// Executa a captura inicial da tela ou janela usando o backend apropriado (`Wayland` portal, `X11` ou `Windows.Graphics.Capture`) em tarefa assíncrona.
 /// Input: `mode` (`CaptureMode`), `is_wayland` (`bool`) | Output: `Task<AppMessage>` emitindo `CaptureReady`
+#[cfg(target_os = "linux")]
 fn start_capture_task(mode: CaptureMode, is_wayland: bool) -> Task<AppMessage> {
     Task::perform(
         async move {
             if is_wayland {
                 let backend = PortalCaptureBackend::new();
-                let res = if mode == CaptureMode::Window {
-                    backend.capture_window().await
+                if mode == CaptureMode::Window {
+                    backend
+                        .capture_window()
+                        .await
+                        .map(|img| (img, backend.supports_window_mode(), Vec::new(), None))
+                        .map_err(|e| e.to_string())
                 } else {
-                    backend.capture_desktop().await
-                };
-                res.map(|img| (img, backend.supports_window_mode(), Vec::new()))
-                    .map_err(|e| e.to_string())
+                    capture_desktop_with_binding()
+                        .await
+                        .map(|(img, binding)| {
+                            (
+                                img,
+                                backend.supports_window_mode(),
+                                Vec::new(),
+                                Some(binding),
+                            )
+                        })
+                        .map_err(|e| e.to_string())
+                }
             } else {
                 let backend = X11CaptureBackend::new();
                 let img = backend.capture_desktop().await.map_err(|e| e.to_string())?;
                 let windows = list_x11_windows().unwrap_or_default();
-                Ok((img, backend.supports_window_mode(), windows))
+                Ok((img, backend.supports_window_mode(), windows, None))
             }
         },
+        AppMessage::CaptureReady,
+    )
+}
+
+/// Executa a captura inicial no Windows 11 via `WindowsCaptureBackend` e enumeração Win32/DWM de janelas.
+/// Input: `_mode` (`CaptureMode`), `_is_wayland` (`bool`) | Output: `Task<AppMessage>` emitindo `CaptureReady`.
+#[cfg(target_os = "windows")]
+fn start_capture_task(_mode: CaptureMode, _is_wayland: bool) -> Task<AppMessage> {
+    Task::perform(
+        async move {
+            let backend = WindowsCaptureBackend::new();
+            let img = backend.capture_desktop().await.map_err(|e| e.to_string())?;
+            let windows = list_windows().unwrap_or_default();
+            Ok((img, backend.supports_window_mode(), windows, None))
+        },
+        AppMessage::CaptureReady,
+    )
+}
+
+/// Fallback neutro de captura inicial fora do Linux e Windows.
+/// Input: `_mode` (`CaptureMode`), `_is_wayland` (`bool`) | Output: `Task<AppMessage>` com erro.
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+fn start_capture_task(_mode: CaptureMode, _is_wayland: bool) -> Task<AppMessage> {
+    Task::perform(
+        async move { Err("Capture backend unsupported on this platform".to_string()) },
         AppMessage::CaptureReady,
     )
 }
@@ -2321,6 +2553,7 @@ fn start_capture_task(mode: CaptureMode, is_wayland: bool) -> Task<AppMessage> {
 fn common_subscription() -> Subscription<AppMessage> {
     let keys = keyboard::on_key_press(|key, _mods| match key {
         keyboard::Key::Named(keyboard::key::Named::Escape) => Some(AppMessage::Cancel),
+        keyboard::Key::Named(keyboard::key::Named::Enter) => Some(AppMessage::ConfirmKey),
         _ => None,
     });
     let closed = iced::window::close_events().map(AppMessage::WindowClosed);
@@ -2372,10 +2605,11 @@ impl IcedApp {
     }
 }
 
-// --- Runner B: iced_layershell::build_pattern::daemon (KDE/wlroots Wayland) ---
+// --- Runner B: iced_layershell::build_pattern::daemon (KDE/wlroots Wayland no Linux) ---
 
 /// Mensagem wrapper gerada pela macro `to_layer_message` para o runner `iced_layershell`.
 /// Armazena: variante `Core(AppMessage)` e variantes de controle layer-shell | Principais métodos: nenhum (enumeração de mensagens)
+#[cfg(target_os = "linux")]
 #[to_layer_message(multi, info_name = "WindowInfo")]
 #[derive(Debug, Clone)]
 enum LayerMsg {
@@ -2384,10 +2618,12 @@ enum LayerMsg {
 
 /// Adaptador de daemon `iced_layershell` para compositores Wayland baseados em wlroots/KDE.
 /// Armazena: `core` (`AppCore`) | Principais métodos: `namespace`, `update`, `view`, `theme`, `subscription`, `id_info`, `set_id_info`, `remove_id`
+#[cfg(target_os = "linux")]
 struct LayerShellApp {
     core: AppCore,
 }
 
+#[cfg(target_os = "linux")]
 impl LayerShellApp {
     /// Informa ao compositor Wayland o identificador namespace `wlr-layer-shell` da aplicação.
     /// Input: `&self` | Output: `String` com o App ID reverso
@@ -2491,6 +2727,7 @@ fn acquire_single_instance_lock() -> Option<File> {
 
 /// Determina se deve usar o runner `iced_layershell` (Wayland fora do GNOME).
 /// Input: `is_wayland` (`bool`) | Output: `bool` (`true` quando em Wayland não-GNOME)
+#[cfg(target_os = "linux")]
 fn should_use_layershell(is_wayland: bool) -> bool {
     if !is_wayland {
         return false;
@@ -2501,6 +2738,7 @@ fn should_use_layershell(is_wayland: bool) -> bool {
 
 /// Registra o atalho global `Ctrl+Shift+S` nas configurações personalizadas do GNOME via `gsettings`.
 /// Input: nenhum | Output: `Result<(), String>`
+#[cfg(target_os = "linux")]
 fn install_gnome_shortcut() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let cmd = format!("{} --mode rect", exe.display());
@@ -2551,23 +2789,74 @@ fn install_gnome_shortcut() -> Result<(), String> {
     Ok(())
 }
 
+/// Registra o executável no menu Run do usuário (`HKCU\...\Run` com `--tray`) e grava o AUMID para Toast/Ctrl+Shift+S no Windows 11.
+/// Input: nenhum | Output: `Result<(), String>`.
+#[cfg(target_os = "windows")]
+fn install_windows_shortcut() -> Result<(), String> {
+    use std::ffi::c_void;
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+
+    notification::ensure_aumid_registered();
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let cmd = format!("\"{}\" --tray", exe.display());
+    let cmd_wide: Vec<u16> = format!("{cmd}\0").encode_utf16().collect();
+
+    let subkey = HSTRING::from(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let value_name = HSTRING::from("LxSnippingTool");
+    unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            &subkey,
+            &value_name,
+            REG_SZ.0,
+            Some(cmd_wide.as_ptr() as *const c_void),
+            (cmd_wide.len() * std::mem::size_of::<u16>()) as u32,
+        )
+        .map_err(|e| format!("RegSetKeyValueW failed: {e}"))?;
+    }
+    println!("Registered startup tray + Ctrl+Shift+S hotkey -> {cmd}");
+    Ok(())
+}
+
 /// Ponto de entrada principal que inicializa telemetria, interpreta CLI, executa o daemon gráfico e mantém clipboard pós-saída.
 /// Input: nenhum | Output: `()` (ou término via `std::process::exit` em erro fatal)
 fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        capture_windows::ensure_per_monitor_dpi_aware();
+        notification::ensure_aumid_registered();
+    }
+
     init_telemetry();
     let cli = Cli::parse();
 
     if cli.install_shortcut {
-        if let Err(err) = install_gnome_shortcut() {
+        #[cfg(target_os = "linux")]
+        let res = install_gnome_shortcut();
+        #[cfg(target_os = "windows")]
+        let res = install_windows_shortcut();
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+        let res: Result<(), String> = Err("Shortcut registration unsupported on this OS".into());
+
+        if let Err(err) = res {
             eprintln!("Failed to register shortcut: {err}");
             std::process::exit(1);
         }
         return;
     }
 
+    #[cfg(target_os = "windows")]
+    if cli.tray && cli.mode.is_none() && cli.editor.is_none() && !cli.history {
+        tray::run_resident_tray_and_hotkey();
+        return;
+    }
+
     if cli.tray {
         tray::spawn_tray_if_available();
     }
+
+    recorder::cleanup_abandoned_recordings();
 
     let config = match load_or_default() {
         Ok(c) => c,
@@ -2597,7 +2886,11 @@ fn main() {
         None
     };
 
+    #[cfg(target_os = "linux")]
     let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    #[cfg(not(target_os = "linux"))]
+    let is_wayland = false;
+
     let system_dark = native_ui::detect_system_dark_theme();
     let initial_phase = if let Some(path) = &cli.editor {
         match EditorState::from_png_file(path) {
@@ -2615,45 +2908,55 @@ fn main() {
         AppPhase::Capturing
     };
 
-    let use_layershell = is_capture_invocation && should_use_layershell(is_wayland);
     let pending_clipboard: Arc<Mutex<Option<ClipboardJob>>> = Arc::new(Mutex::new(None));
 
-    if use_layershell {
-        let core = AppCore::new(
-            initial_phase,
-            mode,
-            delay_secs,
-            config,
-            store,
-            pending_clipboard.clone(),
-            is_wayland,
-            system_dark,
-            lock_guard.take(),
-        );
-        let res = iced_layershell::build_pattern::daemon(
-            LayerShellApp::namespace,
-            LayerShellApp::update,
-            LayerShellApp::view,
-            LayerShellApp::id_info,
-            LayerShellApp::set_id_info,
-            LayerShellApp::remove_id,
-        )
-        .theme(LayerShellApp::theme)
-        .subscription(LayerShellApp::subscription)
-        .layer_settings(LayerShellSettings {
-            anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
-            ..Default::default()
-        })
-        .run_with(move || {
-            let mut app = LayerShellApp { core };
-            let task = app.core.initial_iced_task().map(LayerMsg::Core);
-            (app, task)
-        });
+    #[cfg(target_os = "linux")]
+    let ran_layershell = {
+        let use_layershell = is_capture_invocation && should_use_layershell(is_wayland);
+        if use_layershell {
+            let core = AppCore::new(
+                initial_phase.clone(),
+                mode,
+                delay_secs,
+                config.clone(),
+                store.clone(),
+                pending_clipboard.clone(),
+                is_wayland,
+                system_dark,
+                lock_guard.take(),
+            );
+            let res = iced_layershell::build_pattern::daemon(
+                LayerShellApp::namespace,
+                LayerShellApp::update,
+                LayerShellApp::view,
+                LayerShellApp::id_info,
+                LayerShellApp::set_id_info,
+                LayerShellApp::remove_id,
+            )
+            .theme(LayerShellApp::theme)
+            .subscription(LayerShellApp::subscription)
+            .layer_settings(LayerShellSettings {
+                anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
+                ..Default::default()
+            })
+            .run_with(move || {
+                let mut app = LayerShellApp { core };
+                let task = app.core.initial_iced_task().map(LayerMsg::Core);
+                (app, task)
+            });
 
-        if let Err(err) = res {
-            error!(error = %err, "iced_layershell daemon exited with error");
+            if let Err(err) = res {
+                error!(error = %err, "iced_layershell daemon exited with error");
+            }
+            true
+        } else {
+            false
         }
-    } else {
+    };
+    #[cfg(not(target_os = "linux"))]
+    let ran_layershell = false;
+
+    if !ran_layershell {
         let core = AppCore::new(
             initial_phase,
             mode,
@@ -2688,17 +2991,32 @@ fn main() {
             .build();
         if let Ok(rt) = rt {
             rt.block_on(async move {
-                if !job.snip_path.as_os_str().is_empty() {
-                    let path = job.snip_path.clone();
-                    tokio::spawn(async move {
-                        notification::notify_and_listen_for_edit(path).await;
-                    });
-                }
-                if let Err(err) = AutoClipboardBackend::new()
-                    .copy_png_and_hold(job.png_bytes)
-                    .await
+                #[cfg(target_os = "linux")]
                 {
-                    warn!(error = %err, "clipboard holder exited with error");
+                    if !job.snip_path.as_os_str().is_empty() {
+                        let path = job.snip_path.clone();
+                        tokio::spawn(async move {
+                            notification::notify_and_listen_for_edit(path).await;
+                        });
+                    }
+                    if let Err(err) = AutoClipboardBackend::new()
+                        .copy_png_and_hold(job.png_bytes)
+                        .await
+                    {
+                        warn!(error = %err, "clipboard holder exited with error");
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if let Err(err) = AutoClipboardBackend::new()
+                        .copy_png_and_hold(job.png_bytes)
+                        .await
+                    {
+                        warn!(error = %err, "clipboard copy failed");
+                    }
+                    if !job.snip_path.as_os_str().is_empty() {
+                        notification::notify_and_listen_for_edit(job.snip_path).await;
+                    }
                 }
             });
         }

@@ -1,33 +1,43 @@
 //! Módulo: `recorder`
-//! Objetivos: Gerenciar gravação de tela em Wayland (`ScreenCast`/PipeWire) e X11 (`ximagesrc`) via GStreamer (`gst-launch-1.0 -e`), com áudio do sistema/microfone e pausa/retomada por concatenação sem perdas.
-//! Principais itens: `RecordingTarget`, `VideoProfile`, `PreparedRecording`, `ActiveRecording`, `prepare_recording`, `probe_video_profile`, `save_recording_to_path`
-//! Última alteração: 2026-11-19
+//! Objetivos: Definir tipos e matemática compartilhados de gravação de tela (contenção estrita de região, padding opaco pós-recorte, gerenciamento de arquivos pendentes/locks e caminho padrão por timestamp) despachando entre o backend Linux (`GStreamer`/`PipeWire`/`X11`) e o backend nativo Windows 11 (`WGC` + `WASAPI` + `Media Foundation`).
+//! Principais itens: `RecordingTarget`, `RegionCropPlan`, `VideoProfile`, `PreparedRecording`, `ActiveRecording`, `prepare_recording`, `compute_region_crop`, `cleanup_abandoned_recordings`, `probe_video_profile` e `save_recording_to_path`.
+//! Última alteração: 2026-11-20
 
-use std::fs;
-use std::io::Read;
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use directories::{ProjectDirs, UserDirs};
 use lx_snip_core::scene::Rect;
-use tracing::{info, warn};
+use tracing::debug;
 use uuid::Uuid;
 
-use crate::capture_wayland::{
-    open_screencast_session_for, WaylandScreencastSession, WaylandSource,
-};
+#[cfg(target_os = "linux")]
+#[path = "recorder_linux.rs"]
+mod backend;
+
+#[cfg(target_os = "windows")]
+#[path = "recorder_windows.rs"]
+mod backend;
+
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub use backend::{build_concat_args, build_segment_args};
+#[allow(unused_imports)]
+pub use backend::{prepare_recording, probe_video_profile, ActiveRecording, PreparedRecording};
 
 /// Alvo de captura escolhido no Nível 2 do overlay para gravação de vídeo.
-/// Armazena: variantes `Fullscreen`, `Region` (`rect`, `full_width`, `full_height`) e `Window` | Principais métodos: nenhum (enumeração de configuração)
+/// Armazena: variantes `Fullscreen`, `Region`, `NativeWindow` e `Window` | Principais métodos: nenhum (enumeração de seleção).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecordingTarget {
     /// Entire desktop / default monitor.
     Fullscreen,
-    /// User-drawn rectangle (or selected X11 window bounds).
+    /// User-drawn rectangle clamped rigorously inside screen bounds.
     Region {
         /// Crop rectangle in full-desktop image pixels.
         rect: Rect,
@@ -36,15 +46,43 @@ pub enum RecordingTarget {
         /// Full desktop height in pixels.
         full_height: u32,
     },
+    /// Specific native window handle (`u32` X11 XID on Linux, `HWND` as `u64` on Windows).
+    NativeWindow {
+        /// Platform native window handle.
+        handle: u64,
+    },
     /// Wayland portal-selected single window.
     Window,
 }
 
-/// Perfil de codificação de vídeo e contêiner detectado dinamicamente no GStreamer.
-/// Armazena: variantes `Mp4H264`, `WebmVp8` e `WebmVp9` | Principais métodos: `ext`
+/// Plano exato de recorte e preenchimento opaco pós-recorte para gravação de região ou janela.
+/// Armazena: margens (`top`, `bottom`, `left`, `right`), dimensões recortadas (`crop_w`, `crop_h`) e preenchimentos (`pad_right`, `pad_bottom`) | Principais métodos: nenhum (estrutura de dados).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionCropPlan {
+    /// Pixels removidos do topo antes da codificação.
+    pub top: u32,
+    /// Pixels removidos de baixo antes da codificação.
+    pub bottom: u32,
+    /// Pixels removidos da esquerda antes da codificação.
+    pub left: u32,
+    /// Pixels removidos da direita antes da codificação.
+    pub right: u32,
+    /// Largura real útil após o recorte.
+    pub crop_w: u32,
+    /// Altura real útil após o recorte.
+    pub crop_h: u32,
+    /// Preenchimento opaco à direita adicionado após o recorte quando necessário pelo codec.
+    pub pad_right: u32,
+    /// Preenchimento opaco inferior adicionado após o recorte quando necessário pelo codec.
+    pub pad_bottom: u32,
+}
+
+/// Perfil de codificação de vídeo e contêiner suportado na plataforma ativa.
+/// Armazena: variantes `Mp4H264`, `WebmVp8` e `WebmVp9` | Principais métodos: `ext`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoProfile {
-    /// H.264 (`x264enc`) + Opus in MP4 (`mp4mux`).
+    /// H.264 + AAC/Opus in MP4 (`mp4mux` on Linux / `IMFSinkWriter` on Windows).
     Mp4H264,
     /// Royalty-free VP8 (`vp8enc`) + Opus in WebM (`webmmux`).
     WebmVp8,
@@ -54,7 +92,7 @@ pub enum VideoProfile {
 
 impl VideoProfile {
     /// Retorna a extensão de arquivo correspondente ao perfil de contêiner selecionado.
-    /// Input: `self` | Output: `"mp4"` ou `"webm"`
+    /// Input: `self` | Output: `"mp4"` ou `"webm"`.
     pub fn ext(self) -> &'static str {
         match self {
             Self::Mp4H264 => "mp4",
@@ -63,244 +101,72 @@ impl VideoProfile {
     }
 }
 
-/// Parâmetros internos consolidados para instanciar segmentos do pipeline GStreamer.
-/// Armazena: `is_wayland`, `target`, `profile`, `with_system_audio`, `with_mic`, `has_audio` | Principais métodos: nenhum (estrutura de dados)
-#[derive(Debug, Clone, Copy)]
-struct RecordingPipelineConfig {
-    is_wayland: bool,
-    target: RecordingTarget,
-    profile: VideoProfile,
-    with_system_audio: bool,
-    with_mic: bool,
-    has_audio: bool,
+/// Bloqueio exclusivo da sessão ativa no cache de gravações pendentes (`flock` em Unix ou lock de arquivo no Windows).
+/// Armazena: descritor `_file` e `path` do arquivo `.lock` | Principais métodos: `acquire`, `lock_path_for`, `release_and_remove`.
+pub(crate) struct SessionLockFile {
+    _file: File,
+    path: PathBuf,
 }
 
-/// Controlador de uma sessão ativa de gravação de tela com suporte a pausa e retomada em múltiplos segmentos.
-/// Armazena: `config`, `final_output_path`, `segments`, `current_child`, `wayland_session`, `accumulated_duration`, `segment_started_at`, `paused`, `last_stderr` | Principais métodos: `elapsed_secs`, `pause`, `resume`, `stop`
-pub struct ActiveRecording {
-    config: RecordingPipelineConfig,
-    final_output_path: PathBuf,
-    segments: Vec<PathBuf>,
-    current_child: Option<Child>,
-    wayland_session: Option<WaylandScreencastSession>,
-    accumulated_duration: Duration,
-    segment_started_at: Option<Instant>,
-    paused: bool,
-    last_stderr: String,
-}
-
-impl ActiveRecording {
-    /// Calcula o tempo total ativo de gravação em segundos desconsiderando intervalos em pausa.
-    /// Input: `&self` | Output: duração acumulada em segundos (`u64`)
-    pub fn elapsed_secs(&self) -> u64 {
-        let active = self
-            .segment_started_at
-            .map(|t| t.elapsed())
-            .unwrap_or_default();
-        (self.accumulated_duration + active).as_secs()
+impl SessionLockFile {
+    /// Resolve o caminho `.{stem}.lock` associado ao arquivo final da gravação.
+    /// Input: `final_path` (`&Path`) | Output: `PathBuf` oculto de lock.
+    pub(crate) fn lock_path_for(final_path: &Path) -> PathBuf {
+        let stem = final_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rec");
+        let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+        parent.join(format!(".{stem}.lock"))
     }
 
-    /// Pausa a gravação ativa finalizando de forma limpa o processo GStreamer do segmento corrente.
-    /// Input: `&mut self` | Output: `Result<(), String>`
-    pub async fn pause(&mut self) -> Result<(), String> {
-        if self.paused {
-            return Ok(());
+    /// Cria e adquire um bloqueio exclusivo não bloqueante para proteger os artefatos desta sessão.
+    /// Input: `final_path` (`&Path`) | Output: `Result<Self, String>`.
+    pub(crate) fn acquire(final_path: &Path) -> Result<Self, String> {
+        let lock_path = Self::lock_path_for(final_path);
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
         }
-        if let Some(child) = self.current_child.take() {
-            let err = stop_gst_child(child).await?;
-            if !err.is_empty() {
-                self.last_stderr = err;
+        let file = opts
+            .open(&lock_path)
+            .map_err(|e| format!("failed to open recording session lock: {e}"))?;
+
+        #[cfg(unix)]
+        {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                return Err(format!(
+                    "failed to lock recording session: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
         }
-        if let Some(started) = self.segment_started_at.take() {
-            self.accumulated_duration += started.elapsed();
+        #[cfg(not(unix))]
+        {
+            file.try_lock()
+                .map_err(|e| format!("failed to lock recording session: {e}"))?;
         }
-        self.paused = true;
-        info!(
-            elapsed_secs = self.elapsed_secs(),
-            "paused screen recording"
-        );
-        Ok(())
+
+        Ok(Self {
+            _file: file,
+            path: lock_path,
+        })
     }
 
-    /// Retoma uma gravação pausada reabrindo o descritor PipeWire em Wayland e iniciando novo segmento GStreamer.
-    /// Input: `&mut self` | Output: `Result<(), String>`
-    pub async fn resume(&mut self) -> Result<(), String> {
-        if !self.paused {
-            return Ok(());
-        }
-        if self.config.is_wayland {
-            let source = match self.config.target {
-                RecordingTarget::Window => WaylandSource::Window,
-                _ => WaylandSource::Monitor,
-            };
-            if let Some(session) = self.wayland_session.as_mut() {
-                if let Err(err) = session.reopen_pipewire_remote().await {
-                    warn!(error = %err, "reopen_pipewire_remote failed; opening fresh ScreenCast session");
-                    let fresh = open_screencast_session_for(source)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let old = self.wayland_session.replace(fresh);
-                    if let Some(old_session) = old {
-                        old_session.close().await;
-                    }
-                }
-            } else {
-                let fresh = open_screencast_session_for(source)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                self.wayland_session = Some(fresh);
-            }
-        }
-
-        let seg_path = segment_path(
-            &self.final_output_path,
-            self.segments.len(),
-            self.config.profile.ext(),
-        );
-        let child =
-            match spawn_gst_segment(&self.config, &seg_path, self.wayland_session.as_ref()).await {
-                Ok(child) => child,
-                Err(err) => {
-                    return Err(err);
-                }
-            };
-        self.segments.push(seg_path);
-        self.current_child = Some(child);
-        self.segment_started_at = Some(Instant::now());
-        self.paused = false;
-        info!(segments = self.segments.len(), "resumed screen recording");
-        Ok(())
-    }
-
-    /// Encerra a gravação ativa, fecha a sessão Wayland, concatena segmentos se necessário e informa arquivo e duração.
-    /// Input: `mut self` | Output: `Result<(PathBuf, u64), String>` com caminho temporário final e duração em segundos
-    pub async fn stop(mut self) -> Result<(PathBuf, u64), String> {
-        if let Some(child) = self.current_child.take() {
-            let err = stop_gst_child(child).await?;
-            if !err.is_empty() {
-                self.last_stderr = err;
-            }
-        }
-        if let Some(started) = self.segment_started_at.take() {
-            self.accumulated_duration += started.elapsed();
-        }
-        let elapsed = self.accumulated_duration.as_secs();
-
-        if let Some(session) = self.wayland_session.take() {
-            session.close().await;
-        }
-
-        let mut valid_segments = Vec::new();
-        for seg in &self.segments {
-            let len = fs::metadata(seg).map(|m| m.len()).unwrap_or(0);
-            if len > 0 {
-                valid_segments.push(seg.clone());
-            } else {
-                let _ = fs::remove_file(seg);
-            }
-        }
-
-        if valid_segments.is_empty() {
-            let detail = self.last_stderr.trim();
-            return Err(if detail.is_empty() {
-                "Recording produced an empty video file".to_string()
-            } else {
-                format!("Recording failed (empty output): {detail}")
-            });
-        }
-
-        if valid_segments.len() == 1 {
-            fs::rename(&valid_segments[0], &self.final_output_path)
-                .map_err(|e| format!("failed to finalize recording file: {e}"))?;
-        } else {
-            let res = concat_segments(
-                &valid_segments,
-                &self.final_output_path,
-                self.config.profile,
-                self.config.has_audio,
-            )
-            .await;
-            for seg in &valid_segments {
-                let _ = fs::remove_file(seg);
-            }
-            res?;
-        }
-
-        info!(path = %self.final_output_path.display(), elapsed_secs = elapsed, "recording finalized");
-        Ok((self.final_output_path, elapsed))
-    }
-}
-
-/// Envia `SIGINT` ao processo filho `gst-launch-1.0` para emissão de EOS e lê a saída `stderr`.
-/// Input: `mut child` (`Child`) | Output: `Result<String, String>` com o `stderr` coletado
-async fn stop_gst_child(mut child: Child) -> Result<String, String> {
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: sending SIGINT to our own spawned gst-launch-1.0 child pid so `-e` emits EOS.
-    unsafe {
-        libc::kill(pid, libc::SIGINT);
-    }
-
-    let start_wait = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => break,
-            Ok(None) if start_wait.elapsed() < Duration::from_secs(5) => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Ok(None) => {
-                warn!("gst-launch-1.0 did not exit on SIGINT within 5s; killing");
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-            Err(err) => return Err(format!("failed waiting for gst-launch-1.0: {err}")),
-        }
-    }
-
-    let mut err_text = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut err_text);
-    }
-    Ok(err_text)
-}
-
-/// Verifica se um plugin GStreamer está instalado no sistema consultando `gst-inspect-1.0`.
-/// Input: `name` (`&str`) | Output: `bool` (`true` se disponível)
-fn gst_has_plugin(name: &str) -> bool {
-    Command::new("gst-inspect-1.0")
-        .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// Detecta em tempo de execução os encoders e multiplexadores GStreamer disponíveis (com fallback para WebM).
-/// Input: nenhum | Output: `Result<VideoProfile, String>`
-pub fn probe_video_profile() -> Result<VideoProfile, String> {
-    if !gst_has_plugin("pipewiresrc") && !gst_has_plugin("ximagesrc") {
-        return Err(
-            "GStreamer screen capture plugins missing (install gstreamer1.0-tools and gstreamer1.0-pipewire)"
-                .to_string(),
-        );
-    }
-    if gst_has_plugin("x264enc") && gst_has_plugin("mp4mux") {
-        Ok(VideoProfile::Mp4H264)
-    } else if gst_has_plugin("vp8enc") && gst_has_plugin("webmmux") {
-        Ok(VideoProfile::WebmVp8)
-    } else if gst_has_plugin("vp9enc") && gst_has_plugin("webmmux") {
-        Ok(VideoProfile::WebmVp9)
-    } else {
-        Err(
-            "No supported GStreamer video encoder found (need x264enc+mp4mux or vp8enc/vp9enc+webmmux)"
-                .to_string(),
-        )
+    /// Libera explicitamente e remove o arquivo de lock após finalização ou descarte seguro.
+    /// Input: `self` | Output: nenhum (`()`).
+    pub(crate) fn release_and_remove(self) {
+        let path = self.path.clone();
+        drop(self);
+        let _ = fs::remove_file(path);
     }
 }
 
 /// Resolve o caminho padrão de destino para salvar uma gravação com timestamp local legível.
-/// Input: `ext` (`&str`) | Output: `PathBuf` em `Vídeos/SnippingTool/gravacao_YYYY-MM-DD_HH-MM-SS.<ext>`
+/// Input: `ext` (`&str`) | Output: `PathBuf` em `Vídeos/SnippingTool/gravacao_YYYY-MM-DD_HH-MM-SS.<ext>`.
 pub fn default_recording_save_path(ext: &str) -> PathBuf {
     let dir = UserDirs::new()
         .and_then(|u| u.video_dir().map(|d| d.join("SnippingTool")))
@@ -309,31 +175,53 @@ pub fn default_recording_save_path(ext: &str) -> PathBuf {
         })
         .unwrap_or_else(std::env::temp_dir);
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `localtime_r` writes into stack-allocated `tm` using valid `now`.
-    let local_ptr = unsafe { libc::localtime_r(&now, &mut tm) };
-    let file_name = if !local_ptr.is_null() {
+    #[cfg(unix)]
+    let file_name = {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: `localtime_r` writes into stack-allocated `tm` using valid `now`.
+        let local_ptr = unsafe { libc::localtime_r(&now, &mut tm) };
+        if !local_ptr.is_null() {
+            format!(
+                "gravacao_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.{ext}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            )
+        } else {
+            format!("gravacao_{now}.{ext}")
+        }
+    };
+
+    #[cfg(target_os = "windows")]
+    let file_name = {
+        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
         format!(
             "gravacao_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.{ext}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
         )
-    } else {
-        format!("gravacao_{now}.{ext}")
     };
+
+    #[cfg(all(not(unix), not(target_os = "windows")))]
+    let file_name = {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        format!("gravacao_{secs}.{ext}")
+    };
+
     dir.join(file_name)
 }
 
 /// Move ou copia entre sistemas de arquivos o vídeo temporário para o destino escolhido e remove o temporário.
-/// Input: `src` (`&Path`), `dest` (`&Path`) | Output: `Result<(), String>`
+/// Input: `src` (`&Path`), `dest` (`&Path`) | Output: `Result<(), String>`.
 pub fn save_recording_to_path(src: &Path, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("failed to create save directory: {e}"))?;
@@ -346,24 +234,166 @@ pub fn save_recording_to_path(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Gera um caminho temporário exclusivo no diretório de cache seguro (`0o700`) para armazenar a gravação pendente.
-/// Input: `ext` (`&str`) | Output: `Result<PathBuf, String>`
-fn next_temp_recording_path(ext: &str) -> Result<PathBuf, String> {
-    let dir = ProjectDirs::from("", "", "lx-snippingtool")
+/// Resolve o diretório de cache seguro usado para gravações pendentes e segmentos.
+/// Input: nenhum | Output: `PathBuf` do diretório `pending`.
+fn pending_recordings_dir() -> PathBuf {
+    ProjectDirs::from("", "", "lx-snippingtool")
         .map(|p| p.cache_dir().join("pending"))
-        .unwrap_or_else(|| std::env::temp_dir().join("lx-snippingtool"));
+        .unwrap_or_else(|| std::env::temp_dir().join("lx-snippingtool"))
+}
+
+/// Remove arquivos e segmentos abandonados de sessões anteriores em `pending/`, preservando sessões com lock ativo.
+/// Input: nenhum | Output: quantidade de arquivos removidos (`usize`).
+pub fn cleanup_abandoned_recordings() -> usize {
+    let dir = pending_recordings_dir();
+    cleanup_abandoned_recordings_in(&dir)
+}
+
+/// Extrai o identificador base (`pending_<ms>_<uuid>`) de um nome de arquivo no diretório de gravações pendentes.
+/// Input: `name` (`&str`) | Output: `Option<String>` com o radical da sessão.
+fn extract_pending_stem(name: &str) -> Option<String> {
+    if let Some(inner) = name.strip_prefix('.') {
+        if let Some(idx) = inner.find(".part") {
+            let stem = &inner[..idx];
+            if stem.starts_with("pending_") {
+                return Some(stem.to_string());
+            }
+        }
+        if let Some(stem) = inner.strip_suffix(".lock") {
+            if stem.starts_with("pending_") {
+                return Some(stem.to_string());
+            }
+        }
+        return None;
+    }
+    if name.starts_with("pending_") {
+        let stem = Path::new(name).file_stem()?.to_str()?;
+        return Some(stem.to_string());
+    }
+    None
+}
+
+/// Verifica se existe um arquivo `.lock` ativo (mantido sob lock exclusivo por outro processo) para o radical `stem`.
+/// Input: `dir` (`&Path`), `stem` (`&str`) | Output: `bool` verdadeiro se a sessão ainda estiver ativa.
+fn is_session_lock_active(dir: &Path, stem: &str) -> bool {
+    let lock_path = dir.join(format!(".{stem}.lock"));
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            // Conseguimos o lock: nenhum processo dono está mais vivo.
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            false
+        } else {
+            let err = std::io::Error::last_os_error();
+            matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK))
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        match file.try_lock() {
+            Ok(()) => false,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(_) => false,
+        }
+    }
+}
+
+/// Implementação testável da limpeza de gravações/segmentos órfãos em `dir` respeitando locks ativos e gravações recém-concluídas.
+/// Input: `dir` (`&Path`) | Output: quantidade de arquivos removidos (`usize`).
+pub fn cleanup_abandoned_recordings_in(dir: &Path) -> usize {
+    const MAX_FINISHED_AGE: Duration = Duration::from_secs(24 * 3600);
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut hidden_files: Vec<(String, PathBuf)> = Vec::new();
+    let mut public_files: Vec<(String, PathBuf)> = Vec::new();
+    let mut stems = HashSet::new();
+    let mut stems_with_session_artifacts = HashSet::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = extract_pending_stem(name) else {
+            continue;
+        };
+        stems.insert(stem.clone());
+        if name.starts_with('.') {
+            stems_with_session_artifacts.insert(stem.clone());
+            hidden_files.push((stem, path));
+        } else {
+            public_files.push((stem, path));
+        }
+    }
+
+    let active_stems: HashSet<String> = stems
+        .into_iter()
+        .filter(|stem| is_session_lock_active(dir, stem))
+        .collect();
+
+    let mut removed = 0usize;
+    for (stem, path) in hidden_files {
+        if active_stems.contains(&stem) {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    for (stem, path) in public_files {
+        if active_stems.contains(&stem) {
+            continue;
+        }
+        let is_old = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+            .is_some_and(|age| age > MAX_FINISHED_AGE);
+        if (stems_with_session_artifacts.contains(&stem) || is_old)
+            && fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        debug!(removed, dir = %dir.display(), "cleaned up abandoned recording files");
+    }
+    removed
+}
+
+/// Gera um caminho temporário exclusivo no diretório de cache seguro (`0o700` em Unix) e adquire o lock da sessão.
+/// Input: `ext` (`&str`) | Output: `Result<(PathBuf, SessionLockFile), String>`.
+pub(crate) fn next_temp_recording_path(ext: &str) -> Result<(PathBuf, SessionLockFile), String> {
+    let dir = pending_recordings_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    }
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    Ok(dir.join(format!("pending_{ms}_{}.{ext}", Uuid::new_v4())))
+    let final_path = dir.join(format!("pending_{ms}_{}.{ext}", Uuid::new_v4()));
+    let lock = SessionLockFile::acquire(&final_path)?;
+    Ok((final_path, lock))
 }
 
 /// Constrói o caminho de um arquivo de segmento parcial associado à gravação final.
-/// Input: `final_path` (`&Path`), `index` (`usize`), `ext` (`&str`) | Output: `PathBuf` oculto `.part<index>`
-fn segment_path(final_path: &Path, index: usize, ext: &str) -> PathBuf {
+/// Input: `final_path` (`&Path`), `index` (`usize`), `ext` (`&str`) | Output: `PathBuf` oculto `.part<index>`.
+#[cfg(target_os = "linux")]
+pub(crate) fn segment_path(final_path: &Path, index: usize, ext: &str) -> PathBuf {
     let stem = final_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -372,442 +402,69 @@ fn segment_path(final_path: &Path, index: usize, ext: &str) -> PathBuf {
     parent.join(format!(".{stem}.part{index}.{ext}"))
 }
 
-/// Calcula as margens `(top, bottom, left, right)` alinhadas a múltiplos pares para o elemento `videocrop` do GStreamer.
-/// Input: `rect` (`Rect`), `full_w` (`u32`), `full_h` (`u32`) | Output: tupla `(top, bottom, left, right)`
-pub fn compute_videocrop(rect: Rect, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
-    let r = rect.normalized().clamp(full_w as f32, full_h as f32);
-    let mut left = (r.x.round() as u32) & !1;
-    let mut top = (r.y.round() as u32) & !1;
-    let mut w = (r.width.round() as u32).max(16) & !1;
-    let mut h = (r.height.round() as u32).max(16) & !1;
-    if left + w > full_w {
-        w = (full_w.saturating_sub(left)) & !1;
+/// Calcula limites internos estritos (`ceil`/`floor`) para recorte RGB sem jamais expandir para fora da seleção ou da tela.
+/// Input: `rect` (`Rect`), `full_w` (`u32`), `full_h` (`u32`) | Output: `Result<RegionCropPlan, String>`.
+pub fn compute_region_crop(rect: Rect, full_w: u32, full_h: u32) -> Result<RegionCropPlan, String> {
+    if full_w == 0 || full_h == 0 {
+        return Err("Dimensões da tela de origem são inválidas para gravação.".to_string());
     }
-    if top + h > full_h {
-        h = (full_h.saturating_sub(top)) & !1;
-    }
-    if w < 16 {
-        left = 0;
-        w = full_w & !1;
-    }
-    if h < 16 {
-        top = 0;
-        h = full_h & !1;
-    }
-    let right = full_w.saturating_sub(left + w);
-    let bottom = full_h.saturating_sub(top + h);
-    (top, bottom, left, right)
-}
-
-/// Inicia um processo filho `gst-launch-1.0 -e` para gravar um segmento de vídeo e áudio conforme a configuração.
-/// Input: `config` (`&RecordingPipelineConfig`), `output_path` (`&Path`), `wayland_session` (`Option<&WaylandScreencastSession>`) | Output: `Result<Child, String>`
-async fn spawn_gst_segment(
-    config: &RecordingPipelineConfig,
-    output_path: &Path,
-    wayland_session: Option<&WaylandScreencastSession>,
-) -> Result<Child, String> {
-    let mut args: Vec<String> = vec!["-e".to_string()];
-
-    if config.is_wayland {
-        let session =
-            wayland_session.ok_or_else(|| "Wayland ScreenCast session is missing".to_string())?;
-        let raw_fd = session.pw_fd.as_raw_fd();
-        let node_id = session.node_id;
-
-        args.extend([
-            "pipewiresrc".to_string(),
-            format!("fd={raw_fd}"),
-            format!("path={node_id}"),
-            "do-timestamp=true".to_string(),
-            "keepalive-time=1000".to_string(),
-            "resend-last=true".to_string(),
-        ]);
-    } else {
-        args.extend(["ximagesrc".to_string(), "use-damage=false".to_string()]);
-    }
-
-    args.extend(["!".to_string(), "videoconvert".to_string()]);
-
-    if let RecordingTarget::Region {
-        rect,
-        full_width,
-        full_height,
-    } = config.target
+    let r = rect.normalized();
+    if !r.x.is_finite()
+        || !r.y.is_finite()
+        || !r.width.is_finite()
+        || !r.height.is_finite()
+        || r.width <= 0.0
+        || r.height <= 0.0
     {
-        let (top, bottom, left, right) = compute_videocrop(rect, full_width, full_height);
-        if top > 0 || bottom > 0 || left > 0 || right > 0 {
-            args.extend([
-                "!".to_string(),
-                "videocrop".to_string(),
-                format!("top={top}"),
-                format!("bottom={bottom}"),
-                format!("left={left}"),
-                format!("right={right}"),
-            ]);
-        }
-        args.extend(["!".to_string(), "videoconvert".to_string()]);
+        return Err("Região selecionada para gravação é vazia ou inválida.".to_string());
     }
 
-    match config.profile {
-        VideoProfile::Mp4H264 => {
-            args.extend([
-                "!".to_string(),
-                "x264enc".to_string(),
-                "tune=zerolatency".to_string(),
-                "speed-preset=veryfast".to_string(),
-                "pass=quant".to_string(),
-                "quantizer=22".to_string(),
-                "key-int-max=60".to_string(),
-                "!".to_string(),
-                "video/x-h264,profile=main".to_string(),
-                "!".to_string(),
-                "queue".to_string(),
-                "!".to_string(),
-                "mp4mux".to_string(),
-                "name=mux".to_string(),
-            ]);
-        }
-        VideoProfile::WebmVp8 => {
-            args.extend([
-                "!".to_string(),
-                "vp8enc".to_string(),
-                "deadline=1".to_string(),
-                "threads=4".to_string(),
-                "target-bitrate=8000000".to_string(),
-                "!".to_string(),
-                "queue".to_string(),
-                "!".to_string(),
-                "webmmux".to_string(),
-                "name=mux".to_string(),
-            ]);
-        }
-        VideoProfile::WebmVp9 => {
-            args.extend([
-                "!".to_string(),
-                "vp9enc".to_string(),
-                "deadline=1".to_string(),
-                "threads=4".to_string(),
-                "target-bitrate=8000000".to_string(),
-                "!".to_string(),
-                "queue".to_string(),
-                "!".to_string(),
-                "webmmux".to_string(),
-                "name=mux".to_string(),
-            ]);
-        }
-    }
+    let x0 = (r.x.max(0.0).ceil() as u32).min(full_w);
+    let y0 = (r.y.max(0.0).ceil() as u32).min(full_h);
+    let x1 = ((r.x + r.width).min(full_w as f32).floor() as u32).min(full_w);
+    let y1 = ((r.y + r.height).min(full_h as f32).floor() as u32).min(full_h);
 
-    args.extend([
-        "!".to_string(),
-        "filesink".to_string(),
-        format!("location={}", output_path.display()),
-    ]);
-
-    if config.has_audio {
-        if config.with_system_audio && config.with_mic && gst_has_plugin("audiomixer") {
-            args.extend([
-                "pulsesrc".to_string(),
-                "device=@DEFAULT_MONITOR@".to_string(),
-                "!".to_string(),
-                "audioconvert".to_string(),
-                "!".to_string(),
-                "audioresample".to_string(),
-                "!".to_string(),
-                "queue".to_string(),
-                "!".to_string(),
-                "mix.".to_string(),
-                "pulsesrc".to_string(),
-                "device=@DEFAULT_SOURCE@".to_string(),
-                "!".to_string(),
-                "audioconvert".to_string(),
-                "!".to_string(),
-                "audioresample".to_string(),
-                "!".to_string(),
-                "queue".to_string(),
-                "!".to_string(),
-                "mix.".to_string(),
-                "audiomixer".to_string(),
-                "name=mix".to_string(),
-                "!".to_string(),
-                "audioconvert".to_string(),
-                "!".to_string(),
-                "audioresample".to_string(),
-                "!".to_string(),
-                "opusenc".to_string(),
-                "!".to_string(),
-                "queue".to_string(),
-                "!".to_string(),
-                "mux.".to_string(),
-            ]);
-        } else {
-            let device = if config.with_system_audio {
-                "@DEFAULT_MONITOR@"
-            } else {
-                "@DEFAULT_SOURCE@"
-            };
-            args.extend([
-                "pulsesrc".to_string(),
-                format!("device={device}"),
-                "!".to_string(),
-                "audioconvert".to_string(),
-                "!".to_string(),
-                "audioresample".to_string(),
-                "!".to_string(),
-                "opusenc".to_string(),
-                "!".to_string(),
-                "queue".to_string(),
-                "!".to_string(),
-                "mux.".to_string(),
-            ]);
-        }
-    }
-
-    let mut cmd = Command::new("gst-launch-1.0");
-    cmd.args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-
-    if let Some(session) = wayland_session {
-        let raw_fd = session.pw_fd.as_raw_fd();
-        // SAFETY: pre_exec clears FD_CLOEXEC on the PipeWire fd for the child gst-launch-1.0 process.
-        unsafe {
-            cmd.pre_exec(move || {
-                let flags = libc::fcntl(raw_fd, libc::F_GETFD);
-                if flags >= 0 {
-                    libc::fcntl(raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                }
-                Ok(())
-            });
-        }
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to launch gst-launch-1.0: {e}"))?;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            let mut err_text = String::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_string(&mut err_text);
-            }
-            let _ = fs::remove_file(output_path);
-            let detail = err_text.trim();
-            Err(if detail.is_empty() {
-                format!("gst-launch-1.0 exited early ({status})")
-            } else {
-                format!("gst-launch-1.0 exited early ({status}): {detail}")
-            })
-        }
-        Ok(None) => Ok(child),
-        Err(err) => {
-            let _ = fs::remove_file(output_path);
-            Err(format!("failed checking gst-launch-1.0 status: {err}"))
-        }
-    }
-}
-
-/// Monta os argumentos do `gst-launch-1.0` para concatenar segmentos gravados entre pausas sem recodificação.
-/// Input: `segments` (`&[PathBuf]`), `output_path` (`&Path`), `profile` (`VideoProfile`), `has_audio` (`bool`) | Output: `Vec<String>` com a linha de pipeline
-pub fn build_concat_args(
-    segments: &[PathBuf],
-    output_path: &Path,
-    profile: VideoProfile,
-    has_audio: bool,
-) -> Vec<String> {
-    let (demux, mux) = match profile {
-        VideoProfile::Mp4H264 => ("qtdemux", "mp4mux"),
-        VideoProfile::WebmVp8 | VideoProfile::WebmVp9 => ("matroskademux", "webmmux"),
-    };
-
-    let mut args = vec![
-        "-e".to_string(),
-        "concat".to_string(),
-        "name=vcat".to_string(),
-        "!".to_string(),
-    ];
-    if profile == VideoProfile::Mp4H264 {
-        args.extend(["h264parse".to_string(), "!".to_string()]);
-    }
-    args.extend([
-        "queue".to_string(),
-        "!".to_string(),
-        mux.to_string(),
-        "name=mux".to_string(),
-        "!".to_string(),
-        "filesink".to_string(),
-        format!("location={}", output_path.display()),
-    ]);
-
-    if has_audio {
-        args.extend([
-            "concat".to_string(),
-            "name=acat".to_string(),
-            "!".to_string(),
-            "opusparse".to_string(),
-            "!".to_string(),
-            "queue".to_string(),
-            "!".to_string(),
-            "mux.".to_string(),
-        ]);
-    }
-
-    for (idx, seg) in segments.iter().enumerate() {
-        let d = format!("d{idx}");
-        args.extend([
-            "filesrc".to_string(),
-            format!("location={}", seg.display()),
-            "!".to_string(),
-            demux.to_string(),
-            format!("name={d}"),
-            format!("{d}.video_0"),
-            "!".to_string(),
-            "queue".to_string(),
-            "!".to_string(),
-            "vcat.".to_string(),
-        ]);
-        if has_audio {
-            args.extend([
-                format!("{d}.audio_0"),
-                "!".to_string(),
-                "queue".to_string(),
-                "!".to_string(),
-                "acat.".to_string(),
-            ]);
-        }
-    }
-
-    args
-}
-
-/// Executa `gst-launch-1.0` para mesclar múltiplos arquivos de segmento em um único vídeo final.
-/// Input: `segments` (`&[PathBuf]`), `output_path` (`&Path`), `profile` (`VideoProfile`), `has_audio` (`bool`) | Output: `Result<(), String>`
-async fn concat_segments(
-    segments: &[PathBuf],
-    output_path: &Path,
-    profile: VideoProfile,
-    has_audio: bool,
-) -> Result<(), String> {
-    let args = build_concat_args(segments, output_path, profile, has_audio);
-    let output = tokio::process::Command::new("gst-launch-1.0")
-        .args(&args)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|e| format!("failed to launch gst-launch-1.0 concat: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "failed to merge recording segments ({}): {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    Ok(())
-}
-
-/// Sessão de gravação já preparada e autorizada, aguardando a contagem regressiva para iniciar o GStreamer.
-/// Armazena: `config`, `final_output_path` e `wayland_session` | Principais métodos: `start`, `cancel`
-pub struct PreparedRecording {
-    config: RecordingPipelineConfig,
-    final_output_path: PathBuf,
-    wayland_session: Option<WaylandScreencastSession>,
-}
-
-impl PreparedRecording {
-    /// Inicia efetivamente o processo `gst-launch-1.0` do primeiro segmento após a contagem regressiva.
-    /// Input: `mut self` | Output: `Result<ActiveRecording, String>`
-    pub async fn start(mut self) -> Result<ActiveRecording, String> {
-        let seg0 = segment_path(&self.final_output_path, 0, self.config.profile.ext());
-        let child =
-            match spawn_gst_segment(&self.config, &seg0, self.wayland_session.as_ref()).await {
-                Ok(child) => child,
-                Err(err) => {
-                    if let Some(session) = self.wayland_session.take() {
-                        session.close().await;
-                    }
-                    return Err(err);
-                }
-            };
-
-        info!(
-            path = %self.final_output_path.display(),
-            profile = ?self.config.profile,
-            target = ?self.config.target,
-            "started screen recording"
+    if x0 >= x1 || y0 >= y1 {
+        return Err(
+            "Região selecionada para gravação é vazia após alinhamento rigoroso à área interna."
+                .to_string(),
         );
-        Ok(ActiveRecording {
-            config: self.config,
-            final_output_path: self.final_output_path,
-            segments: vec![seg0],
-            current_child: Some(child),
-            wayland_session: self.wayland_session,
-            accumulated_duration: Duration::ZERO,
-            segment_started_at: Some(Instant::now()),
-            paused: false,
-            last_stderr: String::new(),
-        })
     }
 
-    /// Cancela a gravação preparada antes do início do GStreamer e fecha a sessão Wayland, se existir.
-    /// Input: `mut self` | Output: nenhum (`()`)
-    pub async fn cancel(mut self) {
-        if let Some(session) = self.wayland_session.take() {
-            session.close().await;
-        }
-    }
+    let crop_w = x1 - x0;
+    let crop_h = y1 - y0;
+    let (pad_right, pad_bottom) = compute_even_min_padding(crop_w, crop_h);
+
+    Ok(RegionCropPlan {
+        top: y0,
+        bottom: full_h.saturating_sub(y1),
+        left: x0,
+        right: full_w.saturating_sub(x1),
+        crop_w,
+        crop_h,
+        pad_right,
+        pad_bottom,
+    })
 }
 
-/// Prepara perfil, caminho temporário e sessão Wayland/X11 de gravação sem disparar o pipeline GStreamer ainda.
-/// Input: `is_wayland` (`bool`), `target` (`RecordingTarget`), `with_system_audio` (`bool`), `with_mic` (`bool`) | Output: `Result<PreparedRecording, String>`
-pub async fn prepare_recording(
-    is_wayland: bool,
-    target: RecordingTarget,
-    with_system_audio: bool,
-    with_mic: bool,
-) -> Result<PreparedRecording, String> {
-    let profile = probe_video_profile()?;
-    let final_output_path = next_temp_recording_path(profile.ext())?;
-
-    let wayland_session = if is_wayland {
-        if !gst_has_plugin("pipewiresrc") {
-            return Err("GStreamer pipewiresrc plugin is missing".to_string());
-        }
-        let source = match target {
-            RecordingTarget::Window => WaylandSource::Window,
-            _ => WaylandSource::Monitor,
-        };
-        let session = open_screencast_session_for(source)
-            .await
-            .map_err(|e| e.to_string())?;
-        Some(session)
+/// Calcula o preenchimento mínimo `(pad_right, pad_bottom)` para atingir dimensões pares `>= 16` quando exigido pelo encoder.
+/// Input: `w` (`u32`) e `h` (`u32`) | Output: `(pad_right, pad_bottom)`.
+pub(crate) fn compute_even_min_padding(w: u32, h: u32) -> (u32, u32) {
+    let target_w = if w < 16 {
+        16
+    } else if !w.is_multiple_of(2) {
+        w + 1
     } else {
-        if !gst_has_plugin("ximagesrc") {
-            return Err("GStreamer ximagesrc plugin is missing".to_string());
-        }
-        None
+        w
     };
-
-    let has_audio =
-        (with_system_audio || with_mic) && gst_has_plugin("pulsesrc") && gst_has_plugin("opusenc");
-
-    let config = RecordingPipelineConfig {
-        is_wayland,
-        target,
-        profile,
-        with_system_audio,
-        with_mic,
-        has_audio,
+    let target_h = if h < 16 {
+        16
+    } else if !h.is_multiple_of(2) {
+        h + 1
+    } else {
+        h
     };
-
-    Ok(PreparedRecording {
-        config,
-        final_output_path,
-        wayland_session,
-    })
+    (target_w.saturating_sub(w), target_h.saturating_sub(h))
 }
 
 #[cfg(test)]
@@ -815,42 +472,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn videocrop_even_aligns_and_clamps() {
-        let r = Rect::new(101.0, 51.0, 641.0, 481.0);
-        let (top, bottom, left, right) = compute_videocrop(r, 1920, 1080);
-        assert_eq!(left % 2, 0);
-        assert_eq!(top % 2, 0);
-        assert_eq!((1920 - left - right) % 2, 0);
-        assert_eq!((1080 - top - bottom) % 2, 0);
+    fn region_crop_inward_bounds_no_fullscreen_expansion_and_even_padding() {
+        // Odd narrow strip inside a 1920x1080 screen
+        let plan = compute_region_crop(Rect::new(100.3, 50.2, 5.4, 33.6), 1920, 1080)
+            .expect("valid narrow region");
+        // ceil(100.3)=101, floor(105.7)=105 -> crop_w = 4; ceil(50.2)=51, floor(83.8)=83 -> crop_h = 32
+        assert_eq!(plan.left, 101);
+        assert_eq!(plan.top, 51);
+        assert_eq!(plan.crop_w, 4);
+        assert_eq!(plan.crop_h, 32);
+        assert_eq!(plan.right, 1920 - 105);
+        assert_eq!(plan.bottom, 1080 - 83);
+        // Must pad narrow width (< 16) via padding rather than expanding crop to 1920!
+        assert_eq!(plan.pad_right, 12);
+        assert_eq!(plan.pad_bottom, 0);
+
+        // Edge strip touching right/bottom screen border stays strictly clamped without expanding left/top
+        let edge_plan =
+            compute_region_crop(Rect::new(1915.0, 1070.0, 20.0, 20.0), 1920, 1080).unwrap();
+        assert_eq!(edge_plan.left, 1915);
+        assert_eq!(edge_plan.right, 0);
+        assert_eq!(edge_plan.crop_w, 5);
+        assert_eq!(edge_plan.pad_right, 11);
+
+        // Empty / subpixel-empty after inward rounding must return Err, never Fullscreen!
+        assert!(compute_region_crop(Rect::new(10.6, 10.6, 0.2, 10.0), 1920, 1080).is_err());
+        assert!(compute_region_crop(Rect::new(0.0, 0.0, 0.0, 0.0), 1920, 1080).is_err());
     }
 
     #[test]
-    fn concat_args_mp4_with_and_without_audio() {
-        let segs = vec![PathBuf::from("/tmp/p0.mp4"), PathBuf::from("/tmp/p1.mp4")];
-        let out = PathBuf::from("/tmp/final.mp4");
+    fn cleanup_abandoned_recordings_removes_stale_and_preserves_locked_active_sessions() {
+        let dir = std::env::temp_dir().join(format!("lx_snip_cleanup_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
 
-        let with_audio = build_concat_args(&segs, &out, VideoProfile::Mp4H264, true);
-        assert!(with_audio.contains(&"h264parse".to_string()));
-        assert!(with_audio.contains(&"qtdemux".to_string()));
-        assert!(with_audio.contains(&"opusparse".to_string()));
-        assert!(with_audio.contains(&"d0.audio_0".to_string()));
-        assert!(with_audio.contains(&"d1.audio_0".to_string()));
+        // Active locked session (should be preserved completely)
+        let active_final = dir.join("pending_1000_active.mp4");
+        let _active_lock = SessionLockFile::acquire(&active_final).unwrap();
+        let active_part = dir.join(".pending_1000_active.part0.mp4");
+        fs::write(&active_part, b"active-data").unwrap();
 
-        let video_only = build_concat_args(&segs, &out, VideoProfile::Mp4H264, false);
-        assert!(video_only.contains(&"h264parse".to_string()));
-        assert!(!video_only.contains(&"opusparse".to_string()));
-        assert!(!video_only.contains(&"d0.audio_0".to_string()));
-    }
+        // Fresh finished recording awaiting user Save dialog in another live instance (no .part/.lock, recent mtime -> preserved)
+        let finished_final = dir.join("pending_1001_finished.mp4");
+        fs::write(&finished_final, b"finished-video").unwrap();
 
-    #[test]
-    fn concat_args_webm_with_audio() {
-        let segs = vec![PathBuf::from("/tmp/w0.webm"), PathBuf::from("/tmp/w1.webm")];
-        let out = PathBuf::from("/tmp/final.webm");
-        let args = build_concat_args(&segs, &out, VideoProfile::WebmVp8, true);
-        assert!(args.contains(&"matroskademux".to_string()));
-        assert!(args.contains(&"webmmux".to_string()));
-        assert!(!args.contains(&"h264parse".to_string()));
-        assert!(args.contains(&"opusparse".to_string()));
+        // Abandoned unlocked session (should be removed)
+        let stale_final = dir.join("pending_900_stale.mp4");
+        let stale_part = dir.join(".pending_900_stale.part0.mp4");
+        let stale_lock = SessionLockFile::lock_path_for(&stale_final);
+        fs::write(&stale_part, b"stale-data").unwrap();
+        fs::write(&stale_lock, b"").unwrap();
+        fs::write(&stale_final, b"orphan").unwrap();
+
+        let removed = cleanup_abandoned_recordings_in(&dir);
+        assert_eq!(removed, 3);
+        assert!(active_part.exists(), "active session segment must stay");
+        assert!(
+            SessionLockFile::lock_path_for(&active_final).exists(),
+            "active session lock must stay"
+        );
+        assert!(
+            finished_final.exists(),
+            "fresh finished pending recording without lock/part must be preserved"
+        );
+        assert!(!stale_part.exists());
+        assert!(!stale_lock.exists());
+        assert!(!stale_final.exists());
+
+        drop(_active_lock);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

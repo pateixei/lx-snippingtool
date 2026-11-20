@@ -1,7 +1,7 @@
 //! Módulo: `telemetry`
-//! Objetivos: Inicializar logging estruturado (`tracing` no `stderr` e `journald`) e registrar hook global de panic.
+//! Objetivos: Inicializar logging estruturado (`tracing` no `stderr` e `journald` no Linux) e registrar hook global de panic.
 //! Principais itens: `init_telemetry` e `install_panic_hook`.
-//! Última alteração: 2026-11-19
+//! Última alteração: 2026-11-20
 
 use std::backtrace::Backtrace;
 use std::sync::Once;
@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 static TELEMETRY_INIT: Once = Once::new();
 
-/// Inicializa o sistema de logs (`stderr` + `journald` quando disponível) e o hook de panic uma única vez.
+/// Inicializa o sistema de logs (`stderr`, mais `journald` quando disponível no Linux) e o hook de panic uma única vez.
 /// Input: nenhum | Output: nenhum (efeito colateral idempotente de inicialização global).
 pub fn init_telemetry() {
     TELEMETRY_INIT.call_once(|| {
@@ -26,14 +26,25 @@ pub fn init_telemetry() {
             .with_writer(std::io::stderr)
             .with_target(true);
 
-        // Omit journald cleanly when the journald socket is unavailable (e.g. containers/CI).
-        let journald_layer = tracing_journald::layer().ok();
+        #[cfg(target_os = "linux")]
+        {
+            // Omit journald cleanly when the journald socket is unavailable (e.g. containers/CI).
+            let journald_layer = tracing_journald::layer().ok();
 
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .with(journald_layer)
-            .try_init();
+            let _ = tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt_layer)
+                .with(journald_layer)
+                .try_init();
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt_layer)
+                .try_init();
+        }
 
         install_panic_hook();
     });

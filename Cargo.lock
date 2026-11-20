@@ -2749,6 +2749,7 @@ dependencies = [
  "uuid",
  "wayland-client",
  "wayland-protocols",
+ "windows",
  "wl-clipboard-rs",
  "x11rb",
  "zbus 5.19.0",

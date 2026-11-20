@@ -1,18 +1,17 @@
 //! Módulo: `overlay`
 //! Objetivos: Exibir o overlay congelado multimonitor de seleção visual (retângulo, livre, janela, tela cheia) e a barra flutuante de Nível 1 e Nível 2 para iniciar captura de imagem ou gravação de vídeo.
 //! Principais itens: `RecordTarget`, `OverlayMessage`, `OverlayOutcome`, `OverlayState`, `OverlayCanvas`, `crop_captured_selection`
-//! Última alteração: 2026-11-19
+//! Última alteração: 2026-11-20
 
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::{button, container, image, row, stack, text, Column, Container};
 use iced::{event, Alignment, Color, Element, Length, Point as IcedPoint, Rectangle, Size};
 use lx_snip_core::config::CaptureMode;
-use lx_snip_core::platform::{CapturedImage, OutputGeometry};
+use lx_snip_core::platform::{CapturedImage, OutputGeometry, WindowBounds};
 use lx_snip_core::scene::{Point, Rect};
 use tiny_skia::{FillRule, Mask, PathBuilder, Transform};
 
-use crate::capture_x11::X11WindowBounds;
 use crate::icons;
 use crate::recorder::RecordingTarget;
 
@@ -87,7 +86,7 @@ pub enum OverlayOutcome {
 }
 
 /// Estado completo do overlay de seleção congelada e da barra de ferramentas flutuante.
-/// Armazena: `captured`, `bg_handle`, `mode`, `supports_window_mode`, `x11_windows`, `hovered_window`, `drag_start`, `drag_current`, `lasso_points`, `delay_secs`, `record_target`, `record_system_audio`, `record_mic`, `dark_theme` | Principais métodos: `new`, `with_dark_theme`, `update`, `view`, `view_mode_bar`
+/// Armazena: `captured`, `bg_handle`, `mode`, `supports_window_mode`, `windows`, `hovered_window`, `drag_start`, `drag_current`, `lasso_points`, `delay_secs`, `record_target`, `record_system_audio`, `record_mic`, `dark_theme` | Principais métodos: `new`, `with_dark_theme`, `update`, `view`, `view_mode_bar`
 #[derive(Debug, Clone)]
 pub struct OverlayState {
     /// Full captured desktop image.
@@ -96,11 +95,11 @@ pub struct OverlayState {
     pub bg_handle: Option<image::Handle>,
     /// Active selection mode (Level 1).
     pub mode: CaptureMode,
-    /// Whether in-overlay window selection is supported (X11 `_NET_CLIENT_LIST`).
+    /// Whether in-overlay window selection is supported (X11 `_NET_CLIENT_LIST` or Win32 `EnumWindows`).
     pub supports_window_mode: bool,
-    /// Enumerated X11 windows (empty on Wayland).
-    pub x11_windows: Vec<X11WindowBounds>,
-    /// Currently hovered X11 window rect in image-pixel coordinates.
+    /// Enumerated windows (empty on Wayland).
+    pub windows: Vec<WindowBounds>,
+    /// Currently hovered window rect in image-pixel coordinates.
     pub hovered_window: Option<Rect>,
     /// Active drag start in image-pixel coordinates.
     pub drag_start: Option<Point>,
@@ -122,13 +121,13 @@ pub struct OverlayState {
 
 impl OverlayState {
     /// Inicializa o estado do overlay a partir da imagem desktop capturada e preferências iniciais.
-    /// Input: `captured` (`CapturedImage`), `mode` (`CaptureMode`), `delay_secs` (`u8`), `supports_window_mode` (`bool`), `x11_windows` (`Vec<X11WindowBounds>`) | Output: instância de `OverlayState`
+    /// Input: `captured` (`CapturedImage`), `mode` (`CaptureMode`), `delay_secs` (`u8`), `supports_window_mode` (`bool`), `windows` (`Vec<WindowBounds>`) | Output: instância de `OverlayState`
     pub fn new(
         captured: CapturedImage,
         mode: CaptureMode,
         delay_secs: u8,
         supports_window_mode: bool,
-        x11_windows: Vec<X11WindowBounds>,
+        windows: Vec<WindowBounds>,
     ) -> Self {
         let bg_handle = Some(image::Handle::from_rgba(
             captured.width,
@@ -140,7 +139,7 @@ impl OverlayState {
             bg_handle,
             mode,
             supports_window_mode,
-            x11_windows,
+            windows,
             hovered_window: None,
             drag_start: None,
             drag_current: None,
@@ -215,15 +214,15 @@ impl OverlayState {
                     RecordTarget::Rect | RecordTarget::Window => None,
                 }
             }
-            OverlayMessage::StartRecordNow => {
-                let target =
-                    if self.record_target == RecordTarget::Window && !self.supports_window_mode {
-                        RecordingTarget::Window
-                    } else {
-                        RecordingTarget::Fullscreen
-                    };
-                self.start_recording_outcome(target)
-            }
+            OverlayMessage::StartRecordNow => match self.record_target {
+                RecordTarget::Fullscreen => {
+                    self.start_recording_outcome(RecordingTarget::Fullscreen)
+                }
+                RecordTarget::Window if !self.supports_window_mode => {
+                    self.start_recording_outcome(RecordingTarget::Window)
+                }
+                RecordTarget::Rect | RecordTarget::Window => None,
+            },
             OverlayMessage::ToggleSystemAudio => {
                 self.record_system_audio = !self.record_system_audio;
                 None
@@ -248,12 +247,10 @@ impl OverlayState {
                             self.drag_current = Some(pt);
                         }
                         RecordTarget::Window => {
-                            if let Some(win_rect) = self.find_window_at(pt) {
-                                return self.start_recording_outcome(RecordingTarget::Region {
-                                    rect: win_rect,
-                                    full_width: self.captured.width,
-                                    full_height: self.captured.height,
-                                });
+                            if let Some(win) = self.find_window_bounds_at(pt) {
+                                return self.start_recording_outcome(
+                                    RecordingTarget::NativeWindow { handle: win.id },
+                                );
                             }
                         }
                         RecordTarget::Fullscreen => {}
@@ -367,17 +364,19 @@ impl OverlayState {
         }
     }
 
-    /// Localiza a janela X11 mais acima sob o ponteiro e limita seus limites às dimensões da captura.
+    /// Localiza a entrada completa `WindowBounds` da janela mais acima sob o ponteiro.
+    /// Input: `&self`, `pt` (`Point`) | Output: `Option<&WindowBounds>`
+    fn find_window_bounds_at(&self, pt: Point) -> Option<&WindowBounds> {
+        self.windows.iter().rev().find(|w| w.rect.contains(pt))
+    }
+
+    /// Localiza a janela mais acima sob o ponteiro e limita seus limites às dimensões da captura.
     /// Input: `&self`, `pt` (`Point`) | Output: `Option<Rect>` da janela sob o cursor
     fn find_window_at(&self, pt: Point) -> Option<Rect> {
-        self.x11_windows
-            .iter()
-            .rev()
-            .find(|w| w.rect.contains(pt))
-            .map(|w| {
-                w.rect
-                    .clamp(self.captured.width as f32, self.captured.height as f32)
-            })
+        self.find_window_bounds_at(pt).map(|w| {
+            w.rect
+                .clamp(self.captured.width as f32, self.captured.height as f32)
+        })
     }
 
     /// Conclui a captura retornando a imagem inteira sem recorte para o modo tela cheia.
@@ -510,17 +509,37 @@ impl OverlayState {
                 .style(overlay_pill_btn(self.record_mic, palette))
                 .on_press(OverlayMessage::ToggleMic);
 
-            let start_rec_btn = button(
-                row![
-                    icons::icon(icons::ICON_RECORD, 14.0, Color::WHITE),
-                    text("Iniciar gravação").size(13),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-            )
-            .padding([6, 14])
-            .style(record_action_btn)
-            .on_press(OverlayMessage::StartRecordNow);
+            let can_start_now = self.record_target == RecordTarget::Fullscreen
+                || (self.record_target == RecordTarget::Window && !self.supports_window_mode);
+            let start_rec_btn = if can_start_now {
+                button(
+                    row![
+                        icons::icon(icons::ICON_RECORD, 14.0, Color::WHITE),
+                        text("Iniciar gravação").size(13),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([6, 14])
+                .style(record_action_btn)
+                .on_press(OverlayMessage::StartRecordNow)
+            } else {
+                let hint = if self.record_target == RecordTarget::Rect {
+                    "Arraste a região"
+                } else {
+                    "Clique na janela"
+                };
+                button(
+                    row![
+                        icons::icon(icons::ICON_RECORD, 14.0, palette.fg_disabled),
+                        text(hint).size(13),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([6, 14])
+                .style(overlay_pill_btn(false, palette))
+            };
 
             row![
                 back_btn,
@@ -1095,10 +1114,14 @@ mod tests {
             })
         ));
 
-        // Selecting Retângulo in Level 2 lets the user drag a rect and immediately start.
+        // Selecting Retângulo in Level 2 requires dragging; StartRecordNow must NOT fall back to Fullscreen.
         assert!(st
             .update(OverlayMessage::SelectRecordTarget(RecordTarget::Rect))
             .is_none());
+        assert!(
+            st.update(OverlayMessage::StartRecordNow).is_none(),
+            "StartRecordNow must not start fullscreen while Rect mode is selected"
+        );
         st.update(OverlayMessage::PointerDown(Point::new(20.0, 20.0)));
         st.update(OverlayMessage::PointerMove(Point::new(100.0, 80.0)));
         let drag_outcome = st.update(OverlayMessage::PointerUp(Point::new(100.0, 80.0)));
@@ -1120,6 +1143,37 @@ mod tests {
             win_outcome,
             Some(OverlayOutcome::StartRecording {
                 target: RecordingTarget::Window,
+                ..
+            })
+        ));
+
+        // On X11/Windows (supports_window_mode = true), Window mode requires clicking an explicit window (passing its handle).
+        let captured_x11 = CapturedImage {
+            rgba: vec![0u8; 200 * 100 * 4],
+            width: 200,
+            height: 100,
+            outputs: vec![],
+        };
+        let win_bounds = WindowBounds {
+            id: 0x0042_0001,
+            rect: Rect::new(10.0, 10.0, 80.0, 60.0),
+        };
+        let mut st_x11 =
+            OverlayState::new(captured_x11, CaptureMode::Record, 0, true, vec![win_bounds]);
+        assert!(st_x11
+            .update(OverlayMessage::SelectRecordTarget(RecordTarget::Window))
+            .is_none());
+        assert!(
+            st_x11.update(OverlayMessage::StartRecordNow).is_none(),
+            "native Window mode must not fall back to fullscreen"
+        );
+        let win_click = st_x11.update(OverlayMessage::PointerDown(Point::new(30.0, 30.0)));
+        assert!(matches!(
+            win_click,
+            Some(OverlayOutcome::StartRecording {
+                target: RecordingTarget::NativeWindow {
+                    handle: 0x0042_0001
+                },
                 ..
             })
         ));

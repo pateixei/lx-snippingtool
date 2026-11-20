@@ -1,6 +1,6 @@
 //! Módulo: `scene`
-//! Objetivos: Manter a cena retida de anotações e recorte em coordenadas de pixel com suporte a desfazer/refazer e hit-testing de borracha.
-//! Principais itens: `Point`, `Rect`, `Color`, `ShapeKind`, `AnnotationOp` e `AnnotationScene`.
+//! Objetivos: Manter a cena retida de anotações e recorte em coordenadas de pixel com suporte a desfazer/refazer, estilos de linha, spray, curvas Catmull-Rom/Bézier, formas e hit-testing de borracha.
+//! Principais itens: `Point`, `Rect`, `Color`, `LineStyle`, `ShapeKind`, `AnnotationOp`, `AnnotationScene`, `catmull_rom_spline_points` e `spray_stamp_points`.
 //! Última alteração: 2026-11-19
 
 use serde::{Deserialize, Serialize};
@@ -131,25 +131,40 @@ impl Color {
     }
 }
 
+/// Estilo de traçado de linha aplicado a caneta à mão livre e formas geométricas.
+/// Armazena: variantes `Solid`, `Dotted` e `Dashed` | Principais métodos: `Default::default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LineStyle {
+    /// Linha contínua sólida.
+    #[default]
+    Solid,
+    /// Linha pontilhada (pontos espaçados).
+    Dotted,
+    /// Linha tracejada (segmentos espaçados).
+    Dashed,
+}
+
 /// Enumera as formas geométricas vetoriais suportadas pelo editor.
-/// Armazena: variantes `Rectangle`, `Ellipse`, `Arrow` e `Line` | Principais métodos: nenhum (tipo de dados).
+/// Armazena: variantes `Rectangle`, `Ellipse`, `Arrow`, `DoubleArrow` e `Line` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeKind {
     /// Contorno de retângulo alinhado aos eixos.
     Rectangle,
-    /// Contorno de elipse inscrita no retângulo delimitador.
+    /// Contorno de elipse/esfera inscrita no retângulo delimitador.
     Ellipse,
     /// Segmento reto com ponta de seta em `end`.
     Arrow,
+    /// Segmento reto com pontas de seta nas duas extremidades (`start` e `end`).
+    DoubleArrow,
     /// Segmento reto simples entre `start` e `end`.
     Line,
 }
 
 /// Descreve uma operação retida individual de desenho ou redação na cena.
-/// Armazena: variantes `Pen`, `Highlighter`, `Shape` e `RedactBox` | Principais métodos: nenhum (tipo de dados).
+/// Armazena: variantes `Pen`, `Highlighter`, `Spray`, `CurvedLine`, `Shape` e `RedactBox` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnnotationOp {
-    /// Traço opaco à mão livre com caneta.
+    /// Traço opaco à mão livre com caneta e estilo de linha configurável.
     Pen {
         /// Lista de vértices da polilinha em pixels da imagem.
         points: Vec<Point>,
@@ -157,6 +172,9 @@ pub enum AnnotationOp {
         color: Color,
         /// Espessura do traço em pixels.
         width: f32,
+        /// Estilo de linha (`Solid`, `Dotted` ou `Dashed`).
+        #[serde(default)]
+        style: LineStyle,
     },
     /// Traço translúcido de marca-texto.
     Highlighter {
@@ -168,6 +186,27 @@ pub enum AnnotationOp {
         width: f32,
         /// Multiplicador de opacidade em `[0.0, 1.0]`.
         opacity: f32,
+    },
+    /// Pincel aerógrafo (spray) dispersando partículas em torno da trajetória.
+    Spray {
+        /// Lista de centros da trajetória do jato em pixels da imagem.
+        points: Vec<Point>,
+        /// Cor das partículas do spray.
+        color: Color,
+        /// Raio de dispersão do jato em pixels.
+        radius: f32,
+    },
+    /// Linha curva suavizada por interpolação spline cúbica Catmull-Rom / Bézier sobre pontos de passagem.
+    CurvedLine {
+        /// Lista de amostras brutas ou pontos de passagem em pixels da imagem.
+        points: Vec<Point>,
+        /// Cor da curva.
+        color: Color,
+        /// Espessura do traço em pixels.
+        width: f32,
+        /// Estilo de linha (`Solid`, `Dotted` ou `Dashed`).
+        #[serde(default)]
+        style: LineStyle,
     },
     /// Forma geométrica definida por ponto inicial e final do arrasto.
     Shape {
@@ -181,10 +220,13 @@ pub enum AnnotationOp {
         color: Color,
         /// Espessura da linha em pixels.
         width: f32,
+        /// Estilo de linha do contorno (`Solid`, `Dotted` ou `Dashed`).
+        #[serde(default)]
+        style: LineStyle,
     },
-    /// Caixa sólida preta de redação destrutiva para ocultar conteúdo sensível.
+    /// Caixa de vidro fosco fumê (desfoque forte + camada escura 50% + dispersão estocástica em toda a área e bordas).
     RedactBox {
-        /// Retângulo a ser sobrescrito permanentemente na exportação.
+        /// Retângulo onde o efeito de vidro fosco fumê será aplicado na exportação.
         rect: Rect,
     },
 }
@@ -347,6 +389,19 @@ fn hit_test_op(op: &AnnotationOp, point: Point, radius: f32) -> bool {
             let threshold = radius + (*width).max(1.0) * 0.5;
             hit_test_polyline(points, point, threshold)
         }
+        AnnotationOp::Spray {
+            points,
+            radius: spray_r,
+            ..
+        } => {
+            let threshold = radius + (*spray_r).max(2.0);
+            hit_test_polyline(points, point, threshold)
+        }
+        AnnotationOp::CurvedLine { points, width, .. } => {
+            let threshold = radius + (*width).max(1.0) * 0.5;
+            let spline = catmull_rom_spline_points(points);
+            hit_test_polyline(&spline, point, threshold)
+        }
         AnnotationOp::Shape {
             kind,
             start,
@@ -356,7 +411,7 @@ fn hit_test_op(op: &AnnotationOp, point: Point, radius: f32) -> bool {
         } => {
             let threshold = radius + (*width).max(1.0) * 0.5;
             match kind {
-                ShapeKind::Line | ShapeKind::Arrow => {
+                ShapeKind::Line | ShapeKind::Arrow | ShapeKind::DoubleArrow => {
                     distance_to_segment(point, *start, *end) <= threshold
                 }
                 ShapeKind::Rectangle => {
@@ -389,6 +444,145 @@ fn hit_test_op(op: &AnnotationOp, point: Point, radius: f32) -> bool {
             expanded.contains(point)
         }
     }
+}
+
+/// Gera uma polilinha densamente interpolada por spline cúbica Catmull-Rom / Bézier passando pelos nós principais do caminho.
+/// Input: slice de pontos `raw` | Output: `Vec<Point>` com a curva suavizada.
+pub fn catmull_rom_spline_points(raw: &[Point]) -> Vec<Point> {
+    if raw.len() <= 2 {
+        return raw.to_vec();
+    }
+
+    let (min_knot_dist_sq, end_snap_sq) = if raw.len() <= 24 {
+        (2.0 * 2.0, 2.0 * 2.0)
+    } else {
+        (18.0 * 18.0, 8.0 * 8.0)
+    };
+    let mut knots = Vec::with_capacity(raw.len());
+    knots.push(raw[0]);
+    for &pt in &raw[1..raw.len() - 1] {
+        let last = *knots.last().unwrap_or(&raw[0]);
+        if distance_sq(pt, last) >= min_knot_dist_sq {
+            knots.push(pt);
+        }
+    }
+    let end_pt = raw[raw.len() - 1];
+    let knots_len = knots.len();
+    if let Some(last) = knots.last_mut() {
+        let d_sq = distance_sq(*last, end_pt);
+        if knots_len > 1 && d_sq < end_snap_sq {
+            *last = end_pt;
+        } else if d_sq > 1e-4 {
+            knots.push(end_pt);
+        }
+    }
+
+    if knots.len() == 2 && raw.len() >= 3 {
+        let mid = raw[raw.len() / 2];
+        if distance_sq(mid, knots[0]) > 4.0 && distance_sq(mid, knots[1]) > 4.0 {
+            knots.insert(1, mid);
+        }
+    }
+
+    if knots.len() <= 2 {
+        return knots;
+    }
+
+    const SUBDIVISIONS: usize = 16;
+    let n = knots.len();
+    let mut out = Vec::with_capacity((n - 1) * SUBDIVISIONS + 1);
+    out.push(knots[0]);
+
+    for i in 0..(n - 1) {
+        let p0 = if i == 0 { knots[0] } else { knots[i - 1] };
+        let p1 = knots[i];
+        let p2 = knots[i + 1];
+        let p3 = if i + 2 < n {
+            knots[i + 2]
+        } else {
+            knots[n - 1]
+        };
+
+        let b1 = Point::new(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
+        let b2 = Point::new(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
+
+        for step in 1..=SUBDIVISIONS {
+            let t = (step as f32) / (SUBDIVISIONS as f32);
+            let inv = 1.0 - t;
+            let c0 = inv * inv * inv;
+            let c1 = 3.0 * inv * inv * t;
+            let c2 = 3.0 * inv * t * t;
+            let c3 = t * t * t;
+            out.push(Point::new(
+                c0 * p1.x + c1 * b1.x + c2 * b2.x + c3 * p2.x,
+                c0 * p1.y + c1 * b1.y + c2 * b2.y + c3 * p2.y,
+            ));
+        }
+    }
+
+    out
+}
+
+/// Reamostra uma trajetória de pontos em carimbos uniformemente espaçados para aerógrafo suave (spray contínuo).
+/// Input: slice de pontos `points` e espaçamento `spacing` em pixels | Output: `Vec<Point>` com centros de carimbo distribuídos ao longo do traço.
+pub fn spray_stamp_points(points: &[Point], spacing: f32) -> Vec<Point> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    if points.len() == 1 {
+        return vec![points[0]];
+    }
+
+    let step = spacing.max(1.0);
+    let mut out = Vec::with_capacity(points.len());
+    out.push(points[0]);
+    let mut residual = 0.0_f32;
+
+    for seg in points.windows(2) {
+        let a = seg[0];
+        let b = seg[1];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let seg_len = (dx * dx + dy * dy).sqrt();
+        if seg_len <= 1e-4 {
+            continue;
+        }
+        let mut d = step - residual;
+        while d <= seg_len {
+            let t = (d / seg_len).clamp(0.0, 1.0);
+            out.push(Point::new(a.x + dx * t, a.y + dy * t));
+            d += step;
+        }
+        residual = seg_len - (d - step);
+    }
+
+    out
+}
+
+/// Gera coordenadas determinísticas de partículas de aerógrafo (spray) em torno de um centro `(cx, cy)`.
+/// Input: índice `step_idx`, centro `center` e raio `radius` | Output: `Vec<Point>` com as gotículas geradas.
+pub fn spray_particles_for_point(step_idx: usize, center: Point, radius: f32) -> Vec<Point> {
+    let r = radius.max(2.0);
+    let count = ((r * 1.4).round() as usize).clamp(10, 42);
+    let mut out = Vec::with_capacity(count);
+    let base_seed = (step_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ ((center.x.to_bits() as u64) << 32)
+        ^ (center.y.to_bits() as u64);
+    for i in 0..count {
+        let mut z = base_seed.wrapping_add((i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let u1 = ((z & 0xFFFF) as f32) / 65535.0;
+        let u2 = (((z >> 16) & 0xFFFF) as f32) / 65535.0;
+        let dist = u1.sqrt() * r;
+        let angle = u2 * std::f32::consts::TAU;
+        out.push(Point::new(
+            center.x + dist * angle.cos(),
+            center.y + dist * angle.sin(),
+        ));
+    }
+    out
 }
 
 /// Testa se o ponto alvo está próximo de qualquer segmento de uma polilinha.

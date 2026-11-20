@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -35,18 +36,22 @@ fn enforces_0700_dir_and_0600_file_permissions() {
     let store = SnipStore::new(&guard.0, 10);
 
     let saved = store.save_png(b"\x89PNG\r\n\x1a\nfake").unwrap();
+    assert!(saved.exists());
 
-    let dir_mode = fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        dir_mode, 0o700,
-        "expected 0700 on snips dir, got {dir_mode:o}"
-    );
+    #[cfg(unix)]
+    {
+        let dir_mode = fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "expected 0700 on snips dir, got {dir_mode:o}"
+        );
 
-    let file_mode = fs::metadata(&saved).unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        file_mode, 0o600,
-        "expected 0600 on snip file, got {file_mode:o}"
-    );
+        let file_mode = fs::metadata(&saved).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "expected 0600 on snip file, got {file_mode:o}"
+        );
+    }
 }
 
 #[test]

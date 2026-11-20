@@ -14,7 +14,9 @@ tiny-skia.workspace = true
 image.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tracing-journald.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 directories.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tracing-journald.workspace = true

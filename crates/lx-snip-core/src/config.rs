@@ -34,7 +34,7 @@ pub enum CaptureMode {
 }
 
 /// Representa a configuração persistente do usuário armazenada em `config.toml`.
-/// Armazena: `default_mode`, `default_delay_secs`, `auto_copy` e `history_max_items` | Principais métodos: `Default::default`.
+/// Armazena: `default_mode`, `default_delay_secs`, `auto_copy`, `save_original_to_history` e `history_max_items` | Principais métodos: `Default::default`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -42,8 +42,10 @@ pub struct AppConfig {
     pub default_mode: CaptureMode,
     /// Atraso padrão em segundos antes da captura (`0`, `3`, `5` ou `10`).
     pub default_delay_secs: u8,
-    /// Define se a imagem exportada é copiada automaticamente para a área de transferência.
+    /// Define se a imagem capturada original é copiada automaticamente para a área de transferência ao abrir o editor.
     pub auto_copy: bool,
+    /// Define se a captura original não editada é salva automaticamente no histórico local antes da edição.
+    pub save_original_to_history: bool,
     /// Quantidade máxima de arquivos PNG mantidos no histórico local.
     pub history_max_items: usize,
 }
@@ -55,7 +57,8 @@ impl Default for AppConfig {
         Self {
             default_mode: CaptureMode::Rect,
             default_delay_secs: 0,
-            auto_copy: true,
+            auto_copy: false,
+            save_original_to_history: false,
             history_max_items: DEFAULT_HISTORY_MAX_ITEMS,
         }
     }
@@ -160,7 +163,8 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.default_mode, CaptureMode::Rect);
         assert_eq!(cfg.default_delay_secs, 0);
-        assert!(cfg.auto_copy);
+        assert!(!cfg.auto_copy);
+        assert!(!cfg.save_original_to_history);
         assert_eq!(cfg.history_max_items, 50);
     }
 
@@ -184,8 +188,21 @@ mod tests {
 
         assert_eq!(cfg.default_mode, CaptureMode::Freeform);
         assert_eq!(cfg.default_delay_secs, 5);
-        assert!(cfg.auto_copy);
+        assert!(!cfg.auto_copy);
+        assert!(!cfg.save_original_to_history);
         assert_eq!(cfg.history_max_items, 50);
+    }
+
+    #[test]
+    fn existing_config_migration_preserves_auto_copy_and_keeps_original_history_off() {
+        let path = temp_path("legacy.toml");
+        fs::write(&path, "auto_copy = true\nhistory_max_items = 30\n").unwrap();
+        let cfg = load_or_default_from(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert!(cfg.auto_copy);
+        assert!(!cfg.save_original_to_history);
+        assert_eq!(cfg.history_max_items, 30);
     }
 
     #[test]
@@ -195,7 +212,8 @@ mod tests {
         let cfg = AppConfig {
             default_mode: CaptureMode::Window,
             default_delay_secs: 10,
-            auto_copy: false,
+            auto_copy: true,
+            save_original_to_history: true,
             history_max_items: 25,
         };
 

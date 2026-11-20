@@ -1,27 +1,18 @@
 //! Módulo: `native_ui`
-//! Objetivos: Fornecer janelas nativas GTK4 / Libadwaita para todas as janelas e diálogos do aplicativo (`RecordingDone`, `RecordingBar`, `RecordingToast`, `DelayPill`, `Error`, `History` e `Editor`) e detectar o tema escuro/claro do sistema operacional.
-//! Principais itens: `NativeDoneEvent`, `NativeBarEvent`, `NativeHistoryEvent`, `NativeEditorEvent`, `NativeDoneHandle`, `NativeBarHandle`, `NativeDelayHandle`, `NativeHistoryHandle`, `NativeEditorHandle`, `should_use_native_gtk`, `should_use_native_gtk_editor`, `detect_system_dark_theme`, `spawn_recording_done`, `spawn_recording_bar`, `run_recording_toast`, `parse_toast_outcome`, `spawn_delay_dialog`, `run_error_dialog`, `spawn_history_window`, `spawn_editor_window`
-//! Última alteração: 2026-11-19
+//! Objetivos: Fornecer janelas nativas GTK4 / Libadwaita no Linux (`RecordingDone`, `RecordingBar`, `RecordingToast`, `DelayPill`, `Error`, `History` e `Editor` via stream em memória) e stubs/detecção de tema nativo para Windows 11 (`AppsUseLightTheme`).
+//! Principais itens: `NativeDoneEvent`, `NativeBarEvent`, `NativeHistoryEvent`, `NativeEditorEvent`, `NativeDoneHandle`, `NativeBarHandle`, `NativeDelayHandle`, `NativeHistoryHandle`, `NativeEditorHandle`, `should_use_native_gtk`, `should_use_native_gtk_editor`, `detect_system_dark_theme`, `spawn_recording_done`, `spawn_recording_bar`, `run_recording_toast`, `spawn_delay_dialog`, `run_error_dialog`, `spawn_history_window` e `spawn_editor_window`.
+//! Última alteração: 2026-11-20
 
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::PathBuf;
 
-use directories::ProjectDirs;
-use lx_snip_core::export::{encode_rgba, ExportFormat};
-use lx_snip_core::scene::{AnnotationOp, AnnotationScene, Rect};
-use lx_snip_core::storage::SnipEntry;
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use uuid::Uuid;
+use lx_snip_core::scene::{AnnotationOp, Rect};
 
+#[cfg(target_os = "linux")]
 const NATIVE_GTK_SCRIPT: &str = include_str!("native_ui_gtk.py");
 
 /// Eventos de ação emitidos pelo diálogo nativo `Gravação concluída`.
 /// Armazena: variantes `Save`, `SaveAs` e `Discard` | Principais métodos: nenhum (enumeração de eventos)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeDoneEvent {
     /// Salvar diretamente no caminho padrão sugerido.
@@ -34,6 +25,7 @@ pub enum NativeDoneEvent {
 
 /// Eventos de controle emitidos pela janela nativa da barra de gravação ativa.
 /// Armazena: variantes `TogglePause`, `Stop` e `Closed` | Principais métodos: nenhum (enumeração de eventos)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeBarEvent {
     /// Alternar entre pausar e retomar a gravação em andamento.
@@ -46,6 +38,7 @@ pub enum NativeBarEvent {
 
 /// Eventos de interação emitidos pela janela nativa GTK4 de histórico de capturas.
 /// Armazena: variantes `Refresh`, `Copy`, `Edit`, `Delete` e `Closed` | Principais métodos: nenhum (enumeração de eventos)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeHistoryEvent {
     /// Recarregar a lista de capturas armazenadas.
@@ -62,6 +55,7 @@ pub enum NativeHistoryEvent {
 
 /// Eventos de desenho e ações emitidos pela janela nativa GTK4 do editor de anotações.
 /// Armazena: variantes `PushOp`, `Erase`, `SetCrop`, `Undo`, `Redo`, `Copy`, `Save`, `NewCapture`, `OpenHistory` e `Closed` | Principais métodos: nenhum (enumeração de eventos)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum NativeEditorEvent {
     /// Adiciona uma operação vetorial concluída à cena.
@@ -93,405 +87,414 @@ pub enum NativeEditorEvent {
     Closed,
 }
 
-/// Representa o formato JSON recebido via `stdout` da janela nativa de histórico.
-/// Armazena: variantes `Refresh`, `Copy`, `Edit`, `Delete` e `Close` | Principais métodos: nenhum (desserialização interna)
-#[derive(Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-enum NativeHistoryWire {
-    Refresh,
-    Copy { path: PathBuf },
-    Edit { path: PathBuf },
-    Delete { path: PathBuf },
-    Close,
-}
+#[cfg(target_os = "linux")]
+mod linux_native {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, Command, Stdio};
+    use std::sync::{Arc, Mutex, OnceLock};
 
-/// Representa o formato JSON recebido via `stdout` da janela nativa do editor.
-/// Armazena: variantes `PushOp`, `Erase`, `SetCrop`, `ResetCrop`, `Undo`, `Redo`, `Copy`, `Save`, `New`, `History` e `Close` | Principais métodos: nenhum (desserialização interna)
-#[derive(Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-enum NativeEditorWire {
-    PushOp {
-        op: AnnotationOp,
-    },
-    Erase {
-        x: f32,
-        y: f32,
-        #[serde(default = "default_erase_radius")]
-        radius: f32,
-    },
-    SetCrop {
-        crop: Option<Rect>,
-    },
-    ResetCrop,
-    Undo,
-    Redo,
-    Copy,
-    Save,
-    New,
-    History,
-    Close,
-}
+    use lx_snip_core::export::{encode_rgba, ExportFormat};
+    use lx_snip_core::scene::{AnnotationOp, AnnotationScene, Rect};
+    use lx_snip_core::storage::SnipEntry;
+    use serde::{Deserialize, Serialize};
+    use tokio::sync::mpsc;
 
-/// Retorna o raio padrão em pixels usado pela borracha caso não seja especificado no JSON.
-/// Input: nenhum | Output: `10.0` (`f32`)
-const fn default_erase_radius() -> f32 {
-    10.0
-}
+    use super::{
+        NativeBarEvent, NativeDoneEvent, NativeEditorEvent, NativeHistoryEvent, NATIVE_GTK_SCRIPT,
+    };
 
-/// Item serializado enviado via `stdin` para popular cartões da janela nativa de histórico.
-/// Armazena: `path`, `name` e `kb` | Principais métodos: nenhum (carga útil JSON)
-#[derive(Serialize)]
-struct NativeHistoryItemPayload {
-    path: String,
-    name: String,
-    kb: f64,
-}
+    /// Representa o formato JSON recebido via `stdout` da janela nativa de histórico.
+    /// Armazena: variantes `Refresh`, `Copy`, `Edit`, `Delete` e `Close` | Principais métodos: nenhum (desserialização interna).
+    #[derive(Deserialize)]
+    #[serde(tag = "cmd", rename_all = "snake_case")]
+    enum NativeHistoryWire {
+        Refresh,
+        Copy { path: PathBuf },
+        Edit { path: PathBuf },
+        Delete { path: PathBuf },
+        Close,
+    }
 
-/// Carga JSON completa enviada ao atualizar a lista de capturas da janela nativa de histórico.
-/// Armazena: `items` e `status` | Principais métodos: nenhum (carga útil JSON)
-#[derive(Serialize)]
-struct NativeHistorySyncPayload<'a> {
-    items: Vec<NativeHistoryItemPayload>,
-    status: Option<&'a str>,
-}
+    /// Representa o formato JSON recebido via `stdout` da janela nativa do editor.
+    /// Armazena: variantes `PushOp`, `Erase`, `SetCrop`, `ResetCrop`, `Undo`, `Redo`, `Copy`, `Save`, `New`, `History` e `Close` | Principais métodos: nenhum (desserialização interna)
+    #[derive(Deserialize)]
+    #[serde(tag = "cmd", rename_all = "snake_case")]
+    enum NativeEditorWire {
+        PushOp {
+            op: AnnotationOp,
+        },
+        Erase {
+            x: f32,
+            y: f32,
+            #[serde(default = "default_erase_radius")]
+            radius: f32,
+        },
+        SetCrop {
+            crop: Option<Rect>,
+        },
+        ResetCrop,
+        Undo,
+        Redo,
+        Copy,
+        Save,
+        New,
+        History,
+        Close,
+    }
 
-/// Carga JSON completa enviada ao sincronizar a cena retida com a janela nativa do editor.
-/// Armazena: `ops`, `crop_rect`, `can_undo`, `can_redo` e `status` | Principais métodos: nenhum (carga útil JSON)
-#[derive(Serialize)]
-struct NativeEditorScenePayload<'a> {
-    ops: &'a [AnnotationOp],
-    crop_rect: Option<Rect>,
-    can_undo: bool,
-    can_redo: bool,
-    status: Option<&'a str>,
-}
+    /// Retorna o raio padrão em pixels usado pela borracha caso não seja especificado no JSON.
+    /// Input: nenhum | Output: `10.0` (`f32`)
+    const fn default_erase_radius() -> f32 {
+        10.0
+    }
 
-/// Processo filho gerenciado de janela GTK4/Libadwaita com canal `stdin` para comandos do host.
-/// Armazena: `stdin`, `child` e `cleanup_path` | Principais métodos: `send_line`, `close_and_wait`, `cleanup_temp`, `Drop::drop`
-struct NativeChild {
-    stdin: Option<ChildStdin>,
-    child: Child,
-    cleanup_path: Option<PathBuf>,
-}
+    /// Item serializado enviado via `stdin` para popular cartões da janela nativa de histórico.
+    /// Armazena: `path`, `name` e `kb` | Principais métodos: nenhum (carga útil JSON)
+    #[derive(Serialize)]
+    struct NativeHistoryItemPayload {
+        path: String,
+        name: String,
+        kb: f64,
+    }
 
-impl NativeChild {
-    /// Escreve uma linha de comando para o processo filho nativo e força flush imediato.
-    /// Input: `&mut self`, `line` (`&str`) | Output: `()`
-    fn send_line(&mut self, line: &str) {
-        if let Some(stdin) = self.stdin.as_mut() {
-            let _ = writeln!(stdin, "{line}");
-            let _ = stdin.flush();
+    /// Carga JSON completa enviada ao atualizar a lista de capturas da janela nativa de histórico.
+    /// Armazena: `items` e `status` | Principais métodos: nenhum (carga útil JSON)
+    #[derive(Serialize)]
+    struct NativeHistorySyncPayload<'a> {
+        items: Vec<NativeHistoryItemPayload>,
+        status: Option<&'a str>,
+    }
+
+    /// Carga JSON completa enviada ao sincronizar a cena retida com a janela nativa do editor.
+    /// Armazena: `ops`, `crop_rect`, `can_undo`, `can_redo` e `status` | Principais métodos: nenhum (carga útil JSON)
+    #[derive(Serialize)]
+    struct NativeEditorScenePayload<'a> {
+        ops: &'a [AnnotationOp],
+        crop_rect: Option<Rect>,
+        can_undo: bool,
+        can_redo: bool,
+        status: Option<&'a str>,
+    }
+
+    /// Processo filho gerenciado de janela GTK4/Libadwaita com canal `stdin` para comandos do host.
+    /// Armazena: `stdin` e `child` | Principais métodos: `send_line`, `close_and_wait`, `Drop::drop`
+    struct NativeChild {
+        stdin: Option<ChildStdin>,
+        child: Child,
+    }
+
+    impl NativeChild {
+        /// Escreve uma linha de comando para o processo filho nativo e força flush imediato.
+        /// Input: `&mut self`, `line` (`&str`) | Output: `()`
+        fn send_line(&mut self, line: &str) {
+            if let Some(stdin) = self.stdin.as_mut() {
+                let _ = writeln!(stdin, "{line}");
+                let _ = stdin.flush();
+            }
+        }
+
+        /// Solicita o encerramento gracioso via `close`, fecha `stdin` e recolhe o subprocesso.
+        /// Input: `&mut self` | Output: `()`
+        fn close_and_wait(&mut self) {
+            self.send_line("close");
+            self.stdin.take();
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                if matches!(self.child.try_wait(), Ok(None)) {
+                    let _ = self.child.kill();
+                }
+                let _ = self.child.wait();
+            }
         }
     }
 
-    /// Remove qualquer arquivo temporário associado ao subprocesso nativo caso ainda exista.
-    /// Input: `&mut self` | Output: `()`
-    fn cleanup_temp(&mut self) {
-        if let Some(path) = self.cleanup_path.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
-
-    /// Solicita o encerramento gracioso via `close`, fecha `stdin`, recolhe o subprocesso e limpa temporários.
-    /// Input: `&mut self` | Output: `()`
-    fn close_and_wait(&mut self) {
-        self.send_line("close");
-        self.stdin.take();
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            std::thread::sleep(std::time::Duration::from_millis(80));
+    impl Drop for NativeChild {
+        /// Garante fechamento de `stdin` e término do subprocesso nativo.
+        /// Input: `&mut self` | Output: `()`
+        fn drop(&mut self) {
+            self.stdin.take();
             if matches!(self.child.try_wait(), Ok(None)) {
                 let _ = self.child.kill();
             }
             let _ = self.child.wait();
         }
-        self.cleanup_temp();
-    }
-}
-
-impl Drop for NativeChild {
-    /// Garante fechamento de `stdin`, término do subprocesso nativo e remoção de arquivo temporário.
-    /// Input: `&mut self` | Output: `()`
-    fn drop(&mut self) {
-        self.stdin.take();
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-        self.cleanup_temp();
-    }
-}
-
-/// Handle compartilhável para controlar o diálogo nativo `Gravação concluída` após sua abertura.
-/// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `send_close`, `send_idle`, `send_error`
-#[derive(Clone)]
-pub struct NativeDoneHandle {
-    inner: Arc<Mutex<Option<NativeChild>>>,
-}
-
-impl NativeDoneHandle {
-    /// Fecha imediatamente a janela nativa `Gravação concluída` e aguarda a saída do processo.
-    /// Input: `&self` | Output: `()`
-    pub fn send_close(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(mut proc_handle) = guard.take() {
-                proc_handle.close_and_wait();
-            }
-        }
     }
 
-    /// Reabilita os botões do diálogo nativo após cancelamento de `Salvar como...`.
-    /// Input: `&self` | Output: `()`
-    pub fn send_idle(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(proc_handle) = guard.as_mut() {
-                proc_handle.send_line("idle");
-            }
-        }
+    /// Handle compartilhável para controlar o diálogo nativo `Gravação concluída` após sua abertura.
+    /// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `send_close`, `send_idle`, `send_error`
+    #[derive(Clone)]
+    pub struct NativeDoneHandle {
+        inner: Arc<Mutex<Option<NativeChild>>>,
     }
 
-    /// Exibe uma mensagem de erro no diálogo nativo e reabilita os botões de ação.
-    /// Input: `&self`, `msg` (`&str`) | Output: `()`
-    pub fn send_error(&self, msg: &str) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(proc_handle) = guard.as_mut() {
-                proc_handle.send_line(&format_done_error_cmd(msg));
-            }
-        }
-    }
-}
-
-/// Handle compartilhável para atualizar ou fechar a barra nativa de gravação em andamento.
-/// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `update`, `close`
-#[derive(Clone)]
-pub struct NativeBarHandle {
-    inner: Arc<Mutex<Option<NativeChild>>>,
-}
-
-impl NativeBarHandle {
-    /// Atualiza o cronômetro, estado de pausa e ocupação dos botões na barra nativa.
-    /// Input: `&self`, `elapsed_secs` (`u64`), `paused` (`bool`), `busy` (`bool`) | Output: `()`
-    pub fn update(&self, elapsed_secs: u64, paused: bool, busy: bool) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(proc_handle) = guard.as_mut() {
-                proc_handle.send_line(&format_bar_state_cmd(elapsed_secs, paused, busy));
-            }
-        }
-    }
-
-    /// Fecha a barra nativa de gravação e encerra seu processo associado.
-    /// Input: `&self` | Output: `()`
-    pub fn close(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(mut proc_handle) = guard.take() {
-                proc_handle.close_and_wait();
-            }
-        }
-    }
-}
-
-/// Handle compartilhável para atualizar ou fechar o diálogo nativo de contagem regressiva antes da captura.
-/// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `update_secs`, `close`
-#[derive(Clone)]
-pub struct NativeDelayHandle {
-    inner: Arc<Mutex<Option<NativeChild>>>,
-}
-
-impl NativeDelayHandle {
-    /// Atualiza o contador de segundos exibido na janela nativa de atraso.
-    /// Input: `&self`, `remaining_secs` (`u8`) | Output: `()`
-    pub fn update_secs(&self, remaining_secs: u8) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(proc_handle) = guard.as_mut() {
-                proc_handle.send_line(&format_delay_tick_cmd(remaining_secs));
-            }
-        }
-    }
-
-    /// Fecha a janela nativa de atraso e encerra seu subprocesso associado.
-    /// Input: `&self` | Output: `()`
-    pub fn close(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(mut proc_handle) = guard.take() {
-                proc_handle.close_and_wait();
-            }
-        }
-    }
-}
-
-/// Handle compartilhável para atualizar a listagem ou fechar a janela nativa de histórico.
-/// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `sync_items`, `close`
-#[derive(Clone)]
-pub struct NativeHistoryHandle {
-    inner: Arc<Mutex<Option<NativeChild>>>,
-}
-
-impl NativeHistoryHandle {
-    /// Serializa a lista de capturas e mensagem de status enviando comando `items:` à janela nativa.
-    /// Input: `&self`, `entries` (`&[SnipEntry]`), `status` (`Option<&str>`) | Output: `()`
-    pub fn sync_items(&self, entries: &[SnipEntry], status: Option<&str>) {
-        let items = entries
-            .iter()
-            .map(|entry| {
-                let name = entry
-                    .path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("snip.png")
-                    .to_string();
-                NativeHistoryItemPayload {
-                    path: entry.path.to_string_lossy().into_owned(),
-                    name,
-                    kb: (entry.byte_size as f64) / 1024.0,
+    impl NativeDoneHandle {
+        /// Fecha imediatamente a janela nativa `Gravação concluída` e aguarda a saída do processo.
+        /// Input: `&self` | Output: `()`
+        pub fn send_close(&self) {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(mut proc_handle) = guard.take() {
+                    proc_handle.close_and_wait();
                 }
-            })
-            .collect();
-        let payload = NativeHistorySyncPayload { items, status };
-        if let Ok(json) = serde_json::to_string(&payload) {
+            }
+        }
+
+        /// Reabilita os botões do diálogo nativo após cancelamento de `Salvar como...`.
+        /// Input: `&self` | Output: `()`
+        pub fn send_idle(&self) {
             if let Ok(mut guard) = self.inner.lock() {
                 if let Some(proc_handle) = guard.as_mut() {
-                    proc_handle.send_line(&format!("items:{json}"));
+                    proc_handle.send_line("idle");
                 }
             }
         }
-    }
 
-    /// Fecha a janela nativa de histórico e encerra seu processo associado.
-    /// Input: `&self` | Output: `()`
-    pub fn close(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(mut proc_handle) = guard.take() {
-                proc_handle.close_and_wait();
-            }
-        }
-    }
-}
-
-/// Handle compartilhável para sincronizar a cena de anotações ou fechar a janela nativa do editor.
-/// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `sync_scene`, `close`
-#[derive(Clone)]
-pub struct NativeEditorHandle {
-    inner: Arc<Mutex<Option<NativeChild>>>,
-}
-
-impl NativeEditorHandle {
-    /// Serializa as operações, recorte e estado desfazer/refazer enviando comando `state:` ao editor nativo.
-    /// Input: `&self`, `scene` (`&AnnotationScene`), `status` (`Option<&str>`) | Output: `()`
-    pub fn sync_scene(&self, scene: &AnnotationScene, status: Option<&str>) {
-        let payload = NativeEditorScenePayload {
-            ops: scene.ops(),
-            crop_rect: scene.crop_rect,
-            can_undo: scene.can_undo(),
-            can_redo: scene.can_redo(),
-            status,
-        };
-        if let Ok(json) = serde_json::to_string(&payload) {
+        /// Exibe uma mensagem de erro no diálogo nativo e reabilita os botões de ação.
+        /// Input: `&self`, `msg` (`&str`) | Output: `()`
+        pub fn send_error(&self, msg: &str) {
             if let Ok(mut guard) = self.inner.lock() {
                 if let Some(proc_handle) = guard.as_mut() {
-                    proc_handle.send_line(&format!("state:{json}"));
+                    proc_handle.send_line(&format_done_error_cmd(msg));
                 }
             }
         }
     }
 
-    /// Fecha a janela nativa do editor, encerra o subprocesso e remove o PNG temporário de prévia.
-    /// Input: `&self` | Output: `()`
-    pub fn close(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(mut proc_handle) = guard.take() {
-                proc_handle.close_and_wait();
+    /// Handle compartilhável para atualizar ou fechar a barra nativa de gravação em andamento.
+    /// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `update`, `close`
+    #[derive(Clone)]
+    pub struct NativeBarHandle {
+        inner: Arc<Mutex<Option<NativeChild>>>,
+    }
+
+    impl NativeBarHandle {
+        /// Atualiza o cronômetro, estado de pausa e ocupação dos botões na barra nativa.
+        /// Input: `&self`, `elapsed_secs` (`u64`), `paused` (`bool`), `busy` (`bool`) | Output: `()`
+        pub fn update(&self, elapsed_secs: u64, paused: bool, busy: bool) {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(proc_handle) = guard.as_mut() {
+                    proc_handle.send_line(&format_bar_state_cmd(elapsed_secs, paused, busy));
+                }
+            }
+        }
+
+        /// Fecha a barra nativa de gravação e encerra seu processo associado.
+        /// Input: `&self` | Output: `()`
+        pub fn close(&self) {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(mut proc_handle) = guard.take() {
+                    proc_handle.close_and_wait();
+                }
             }
         }
     }
-}
 
-/// Converte uma linha recebida em `stdout` do diálogo nativo para `NativeDoneEvent`.
-/// Input: `line` (`&str`) | Output: `Option<NativeDoneEvent>`
-pub fn parse_done_event(line: &str) -> Option<NativeDoneEvent> {
-    match line.trim() {
-        "save" => Some(NativeDoneEvent::Save),
-        "save_as" => Some(NativeDoneEvent::SaveAs),
-        "discard" => Some(NativeDoneEvent::Discard),
-        _ => None,
-    }
-}
-
-/// Converte uma linha recebida em `stdout` da barra nativa para `NativeBarEvent`.
-/// Input: `line` (`&str`) | Output: `Option<NativeBarEvent>`
-pub fn parse_bar_event(line: &str) -> Option<NativeBarEvent> {
-    match line.trim() {
-        "toggle_pause" => Some(NativeBarEvent::TogglePause),
-        "stop" => Some(NativeBarEvent::Stop),
-        "closed" => Some(NativeBarEvent::Closed),
-        _ => None,
-    }
-}
-
-/// Converte uma linha JSON recebida em `stdout` da janela nativa de histórico para `NativeHistoryEvent`.
-/// Input: `line` (`&str`) | Output: `Option<NativeHistoryEvent>`
-pub fn parse_history_event(line: &str) -> Option<NativeHistoryEvent> {
-    let parsed: NativeHistoryWire = serde_json::from_str(line.trim()).ok()?;
-    Some(match parsed {
-        NativeHistoryWire::Refresh => NativeHistoryEvent::Refresh,
-        NativeHistoryWire::Copy { path } => NativeHistoryEvent::Copy(path),
-        NativeHistoryWire::Edit { path } => NativeHistoryEvent::Edit(path),
-        NativeHistoryWire::Delete { path } => NativeHistoryEvent::Delete(path),
-        NativeHistoryWire::Close => NativeHistoryEvent::Closed,
-    })
-}
-
-/// Converte uma linha JSON recebida em `stdout` da janela nativa do editor para `NativeEditorEvent`.
-/// Input: `line` (`&str`) | Output: `Option<NativeEditorEvent>`
-pub fn parse_editor_event(line: &str) -> Option<NativeEditorEvent> {
-    let parsed: NativeEditorWire = serde_json::from_str(line.trim()).ok()?;
-    Some(match parsed {
-        NativeEditorWire::PushOp { op } => NativeEditorEvent::PushOp(op),
-        NativeEditorWire::Erase { x, y, radius } => NativeEditorEvent::Erase { x, y, radius },
-        NativeEditorWire::SetCrop { crop } => NativeEditorEvent::SetCrop(crop),
-        NativeEditorWire::ResetCrop => NativeEditorEvent::SetCrop(None),
-        NativeEditorWire::Undo => NativeEditorEvent::Undo,
-        NativeEditorWire::Redo => NativeEditorEvent::Redo,
-        NativeEditorWire::Copy => NativeEditorEvent::Copy,
-        NativeEditorWire::Save => NativeEditorEvent::Save,
-        NativeEditorWire::New => NativeEditorEvent::NewCapture,
-        NativeEditorWire::History => NativeEditorEvent::OpenHistory,
-        NativeEditorWire::Close => NativeEditorEvent::Closed,
-    })
-}
-
-/// Formata o comando de atualização de estado enviado via `stdin` para a barra nativa.
-/// Input: `elapsed_secs` (`u64`), `paused` (`bool`), `busy` (`bool`) | Output: `String` no formato `state:<seg>:<0|1>:<0|1>`
-pub fn format_bar_state_cmd(elapsed_secs: u64, paused: bool, busy: bool) -> String {
-    format!(
-        "state:{}:{}:{}",
-        elapsed_secs,
-        u8::from(paused),
-        u8::from(busy)
-    )
-}
-
-/// Formata o comando de erro enviado via `stdin` ao diálogo nativo sanando quebras de linha.
-/// Input: `msg` (`&str`) | Output: `String` em linha única prefixada por `error:`
-pub fn format_done_error_cmd(msg: &str) -> String {
-    let single_line = msg.replace(['\r', '\n'], " ");
-    format!("error:{single_line}")
-}
-
-/// Formata o comando de atualização de contagem regressiva enviado ao diálogo nativo de atraso.
-/// Input: `remaining_secs` (`u8`) | Output: `String` no formato `tick:<segundos>`
-pub fn format_delay_tick_cmd(remaining_secs: u8) -> String {
-    format!("tick:{remaining_secs}")
-}
-
-/// Verifica de forma preguiçosa e armazenada em cache se GTK4 + Libadwaita estão disponíveis para janelas nativas.
-/// Input: nenhum | Output: `bool` (`true` fora de desktops puramente KDE quando `gi`/`Gtk 4.0`/`Adw 1` carregam)
-pub fn should_use_native_gtk() -> bool {
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    if desktop.to_ascii_uppercase().contains("KDE") {
-        return false;
+    /// Handle compartilhável para atualizar ou fechar o diálogo nativo de contagem regressiva antes da captura.
+    /// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `update_secs`, `close`
+    #[derive(Clone)]
+    pub struct NativeDelayHandle {
+        inner: Arc<Mutex<Option<NativeChild>>>,
     }
 
-    static PROBE: OnceLock<bool> = OnceLock::new();
-    *PROBE.get_or_init(|| {
+    impl NativeDelayHandle {
+        /// Atualiza o contador de segundos exibido na janela nativa de atraso.
+        /// Input: `&self`, `remaining_secs` (`u8`) | Output: `()`
+        pub fn update_secs(&self, remaining_secs: u8) {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(proc_handle) = guard.as_mut() {
+                    proc_handle.send_line(&format_delay_tick_cmd(remaining_secs));
+                }
+            }
+        }
+
+        /// Fecha a janela nativa de atraso e encerra seu subprocesso associado.
+        /// Input: `&self` | Output: `()`
+        pub fn close(&self) {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(mut proc_handle) = guard.take() {
+                    proc_handle.close_and_wait();
+                }
+            }
+        }
+    }
+
+    /// Handle compartilhável para atualizar a listagem ou fechar a janela nativa de histórico.
+    /// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `sync_items`, `close`
+    #[derive(Clone)]
+    pub struct NativeHistoryHandle {
+        inner: Arc<Mutex<Option<NativeChild>>>,
+    }
+
+    impl NativeHistoryHandle {
+        /// Serializa a lista de capturas e mensagem de status enviando comando `items:` à janela nativa.
+        /// Input: `&self`, `entries` (`&[SnipEntry]`), `status` (`Option<&str>`) | Output: `()`
+        pub fn sync_items(&self, entries: &[SnipEntry], status: Option<&str>) {
+            let items = entries
+                .iter()
+                .map(|entry| {
+                    let name = entry
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("snip.png")
+                        .to_string();
+                    NativeHistoryItemPayload {
+                        path: entry.path.to_string_lossy().into_owned(),
+                        name,
+                        kb: (entry.byte_size as f64) / 1024.0,
+                    }
+                })
+                .collect();
+            let payload = NativeHistorySyncPayload { items, status };
+            if let Ok(json) = serde_json::to_string(&payload) {
+                if let Ok(mut guard) = self.inner.lock() {
+                    if let Some(proc_handle) = guard.as_mut() {
+                        proc_handle.send_line(&format!("items:{json}"));
+                    }
+                }
+            }
+        }
+
+        /// Fecha a janela nativa de histórico e encerra seu processo associado.
+        /// Input: `&self` | Output: `()`
+        pub fn close(&self) {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(mut proc_handle) = guard.take() {
+                    proc_handle.close_and_wait();
+                }
+            }
+        }
+    }
+
+    /// Handle compartilhável para sincronizar a cena de anotações ou fechar a janela nativa do editor.
+    /// Armazena: `inner` (`Arc<Mutex<Option<NativeChild>>>`) | Principais métodos: `sync_scene`, `close`
+    #[derive(Clone)]
+    pub struct NativeEditorHandle {
+        inner: Arc<Mutex<Option<NativeChild>>>,
+    }
+
+    impl NativeEditorHandle {
+        /// Serializa as operações, recorte e estado desfazer/refazer enviando comando `state:` ao editor nativo.
+        /// Input: `&self`, `scene` (`&AnnotationScene`), `status` (`Option<&str>`) | Output: `()`
+        pub fn sync_scene(&self, scene: &AnnotationScene, status: Option<&str>) {
+            let payload = NativeEditorScenePayload {
+                ops: scene.ops(),
+                crop_rect: scene.crop_rect,
+                can_undo: scene.can_undo(),
+                can_redo: scene.can_redo(),
+                status,
+            };
+            if let Ok(json) = serde_json::to_string(&payload) {
+                if let Ok(mut guard) = self.inner.lock() {
+                    if let Some(proc_handle) = guard.as_mut() {
+                        proc_handle.send_line(&format!("state:{json}"));
+                    }
+                }
+            }
+        }
+
+        /// Fecha a janela nativa do editor, encerra o subprocesso e remove o PNG temporário de prévia.
+        /// Input: `&self` | Output: `()`
+        pub fn close(&self) {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(mut proc_handle) = guard.take() {
+                    proc_handle.close_and_wait();
+                }
+            }
+        }
+    }
+
+    /// Converte uma linha recebida em `stdout` do diálogo nativo para `NativeDoneEvent`.
+    /// Input: `line` (`&str`) | Output: `Option<NativeDoneEvent>`
+    pub fn parse_done_event(line: &str) -> Option<NativeDoneEvent> {
+        match line.trim() {
+            "save" => Some(NativeDoneEvent::Save),
+            "save_as" => Some(NativeDoneEvent::SaveAs),
+            "discard" => Some(NativeDoneEvent::Discard),
+            _ => None,
+        }
+    }
+
+    /// Converte uma linha recebida em `stdout` da barra nativa para `NativeBarEvent`.
+    /// Input: `line` (`&str`) | Output: `Option<NativeBarEvent>`
+    pub fn parse_bar_event(line: &str) -> Option<NativeBarEvent> {
+        match line.trim() {
+            "toggle_pause" => Some(NativeBarEvent::TogglePause),
+            "stop" => Some(NativeBarEvent::Stop),
+            "closed" => Some(NativeBarEvent::Closed),
+            _ => None,
+        }
+    }
+
+    /// Converte uma linha JSON recebida em `stdout` da janela nativa de histórico para `NativeHistoryEvent`.
+    /// Input: `line` (`&str`) | Output: `Option<NativeHistoryEvent>`
+    pub fn parse_history_event(line: &str) -> Option<NativeHistoryEvent> {
+        let parsed: NativeHistoryWire = serde_json::from_str(line.trim()).ok()?;
+        Some(match parsed {
+            NativeHistoryWire::Refresh => NativeHistoryEvent::Refresh,
+            NativeHistoryWire::Copy { path } => NativeHistoryEvent::Copy(path),
+            NativeHistoryWire::Edit { path } => NativeHistoryEvent::Edit(path),
+            NativeHistoryWire::Delete { path } => NativeHistoryEvent::Delete(path),
+            NativeHistoryWire::Close => NativeHistoryEvent::Closed,
+        })
+    }
+
+    /// Converte uma linha JSON recebida em `stdout` da janela nativa do editor para `NativeEditorEvent`.
+    /// Input: `line` (`&str`) | Output: `Option<NativeEditorEvent>`
+    pub fn parse_editor_event(line: &str) -> Option<NativeEditorEvent> {
+        let parsed: NativeEditorWire = serde_json::from_str(line.trim()).ok()?;
+        Some(match parsed {
+            NativeEditorWire::PushOp { op } => NativeEditorEvent::PushOp(op),
+            NativeEditorWire::Erase { x, y, radius } => NativeEditorEvent::Erase { x, y, radius },
+            NativeEditorWire::SetCrop { crop } => NativeEditorEvent::SetCrop(crop),
+            NativeEditorWire::ResetCrop => NativeEditorEvent::SetCrop(None),
+            NativeEditorWire::Undo => NativeEditorEvent::Undo,
+            NativeEditorWire::Redo => NativeEditorEvent::Redo,
+            NativeEditorWire::Copy => NativeEditorEvent::Copy,
+            NativeEditorWire::Save => NativeEditorEvent::Save,
+            NativeEditorWire::New => NativeEditorEvent::NewCapture,
+            NativeEditorWire::History => NativeEditorEvent::OpenHistory,
+            NativeEditorWire::Close => NativeEditorEvent::Closed,
+        })
+    }
+
+    /// Formata o comando de atualização de estado enviado via `stdin` para a barra nativa.
+    /// Input: `elapsed_secs` (`u64`), `paused` (`bool`), `busy` (`bool`) | Output: `String` no formato `state:<seg>:<0|1>:<0|1>`
+    pub fn format_bar_state_cmd(elapsed_secs: u64, paused: bool, busy: bool) -> String {
+        format!(
+            "state:{}:{}:{}",
+            elapsed_secs,
+            u8::from(paused),
+            u8::from(busy)
+        )
+    }
+
+    /// Formata o comando de erro enviado via `stdin` ao diálogo nativo sanando quebras de linha.
+    /// Input: `msg` (`&str`) | Output: `String` em linha única prefixada por `error:`
+    pub fn format_done_error_cmd(msg: &str) -> String {
+        let single_line = msg.replace(['\r', '\n'], " ");
+        format!("error:{single_line}")
+    }
+
+    /// Formata o comando de atualização de contagem regressiva enviado ao diálogo nativo de atraso.
+    /// Input: `remaining_secs` (`u8`) | Output: `String` no formato `tick:<segundos>`
+    pub fn format_delay_tick_cmd(remaining_secs: u8) -> String {
+        format!("tick:{remaining_secs}")
+    }
+
+    /// Verifica de forma preguiçosa e armazenada em cache se GTK4 + Libadwaita estão disponíveis para janelas nativas.
+    /// Input: nenhum | Output: `bool` (`true` fora de desktops puramente KDE quando `gi`/`Gtk 4.0`/`Adw 1` carregam)
+    pub fn should_use_native_gtk() -> bool {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        if desktop.to_ascii_uppercase().contains("KDE") {
+            return false;
+        }
+
+        static PROBE: OnceLock<bool> = OnceLock::new();
+        *PROBE.get_or_init(|| {
         Command::new("python3")
             .args([
                 "-c",
@@ -503,404 +506,629 @@ pub fn should_use_native_gtk() -> bool {
             .status()
             .is_ok_and(|s| s.success())
     })
-}
-
-/// Verifica de forma preguiçosa e em cache se GTK4 + Libadwaita + PyCairo estão disponíveis para o editor nativo.
-/// Input: nenhum | Output: `bool` (`true` quando `should_use_native_gtk()` e `import cairo` têm sucesso)
-pub fn should_use_native_gtk_editor() -> bool {
-    if !should_use_native_gtk() {
-        return false;
     }
 
-    static CAIRO_PROBE: OnceLock<bool> = OnceLock::new();
-    *CAIRO_PROBE.get_or_init(|| {
-        Command::new("python3")
-            .args(["-c", "import cairo"])
+    /// Verifica de forma preguiçosa e em cache se GTK4 + Libadwaita + PyCairo estão disponíveis para o editor nativo.
+    /// Input: nenhum | Output: `bool` (`true` quando `should_use_native_gtk()` e `import cairo` têm sucesso)
+    pub fn should_use_native_gtk_editor() -> bool {
+        if !should_use_native_gtk() {
+            return false;
+        }
+
+        static CAIRO_PROBE: OnceLock<bool> = OnceLock::new();
+        *CAIRO_PROBE.get_or_init(|| {
+            Command::new("python3")
+                .args(["-c", "import cairo"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    }
+
+    /// Detecta se o ambiente de desktop prefere tema escuro consultando o portal XDG ou `gsettings`.
+    /// Input: nenhum | Output: `bool` (`true` quando `color-scheme` indica preferência por modo escuro)
+    pub fn detect_system_dark_theme() -> bool {
+        if let Ok(out) = Command::new("dbus-send")
+            .args([
+                "--reply-timeout=100",
+                "--print-reply=literal",
+                "--dest=org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings.Read",
+                "string:org.freedesktop.appearance",
+                "string:color-scheme",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                return stdout.trim().ends_with("uint32 1");
+            }
+        }
+
+        Command::new("gsettings")
+            .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| {
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains("prefer-dark")
+            })
+    }
+
+    /// Abre o diálogo nativo GTK4/Libadwaita `Gravação concluída` retornando handle de controle e receptor de eventos.
+    /// Input: `duration_secs` (`u64`), `ext` (`&str`), `default_save_path` (`&Path`) | Output: `Result<(NativeDoneHandle, mpsc::UnboundedReceiver<NativeDoneEvent>), String>`
+    pub fn spawn_recording_done(
+        duration_secs: u64,
+        ext: &str,
+        default_save_path: &Path,
+    ) -> Result<(NativeDoneHandle, mpsc::UnboundedReceiver<NativeDoneEvent>), String> {
+        let duration_arg = duration_secs.to_string();
+        let default_arg = default_save_path.to_string_lossy().into_owned();
+        let mut child = Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                NATIVE_GTK_SCRIPT,
+                "done",
+                &duration_arg,
+                ext,
+                &default_arg,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn native GTK done dialog: {e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "missing stdin pipe on native done dialog".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "missing stdout pipe on native done dialog".to_string())?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(ev) = parse_done_event(&line) {
+                    let _ = tx.send(ev);
+                }
+            }
+        });
+
+        let handle = NativeDoneHandle {
+            inner: Arc::new(Mutex::new(Some(NativeChild {
+                stdin: Some(stdin),
+                child,
+            }))),
+        };
+        Ok((handle, rx))
+    }
+
+    /// Abre a janela nativa GTK4/Libadwaita da barra flutuante de controle durante a gravação.
+    /// Input: `elapsed_secs` (`u64`), `paused` (`bool`), `busy` (`bool`) | Output: `Result<(NativeBarHandle, mpsc::UnboundedReceiver<NativeBarEvent>), String>`
+    pub fn spawn_recording_bar(
+        elapsed_secs: u64,
+        paused: bool,
+        busy: bool,
+    ) -> Result<(NativeBarHandle, mpsc::UnboundedReceiver<NativeBarEvent>), String> {
+        let elapsed_arg = elapsed_secs.to_string();
+        let paused_arg = if paused { "1" } else { "0" };
+        let busy_arg = if busy { "1" } else { "0" };
+        let mut child = Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                NATIVE_GTK_SCRIPT,
+                "bar",
+                &elapsed_arg,
+                paused_arg,
+                busy_arg,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn native GTK recording bar: {e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "missing stdin pipe on native recording bar".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "missing stdout pipe on native recording bar".to_string())?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(ev) = parse_bar_event(&line) {
+                    let _ = tx.send(ev);
+                }
+            }
+        });
+
+        let handle = NativeBarHandle {
+            inner: Arc::new(Mutex::new(Some(NativeChild {
+                stdin: Some(stdin),
+                child,
+            }))),
+        };
+        Ok((handle, rx))
+    }
+
+    /// Interpreta a saída padrão emitida pela janela pré-gravação indicando se a contagem completou ou foi cancelada.
+    /// Input: `stdout` (`&str`) | Output: `bool` (`true` quando recebeu `"ready"`, `false` para `"cancel"` ou vazio)
+    pub fn parse_toast_outcome(stdout: &str) -> bool {
+        stdout.lines().any(|line| line.trim() == "ready")
+    }
+
+    /// Exibe a janela nativa GTK4/Libadwaita de contagem regressiva pré-gravação (2 → 1 → 0 s) e aguarda sua conclusão ou cancelamento.
+    /// Input: nenhum | Output: `Result<bool, String>` (`Ok(true)` para iniciar gravação, `Ok(false)` se cancelada pelo usuário)
+    pub fn run_recording_toast() -> Result<bool, String> {
+        let output = Command::new("python3")
+            .args(["-u", "-c", NATIVE_GTK_SCRIPT, "toast"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("failed to run native GTK toast: {e}"))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "native GTK toast exited with status {}",
+                output.status
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_toast_outcome(&stdout))
+    }
+
+    /// Abre o diálogo nativo GTK4/Libadwaita de contagem regressiva retornando handle e canal de cancelamento.
+    /// Input: `remaining_secs` (`u8`) | Output: `Result<(NativeDelayHandle, mpsc::UnboundedReceiver<()>), String>`
+    pub fn spawn_delay_dialog(
+        remaining_secs: u8,
+    ) -> Result<(NativeDelayHandle, mpsc::UnboundedReceiver<()>), String> {
+        let secs_arg = remaining_secs.to_string();
+        let mut child = Command::new("python3")
+            .args(["-u", "-c", NATIVE_GTK_SCRIPT, "delay", &secs_arg])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn native GTK delay dialog: {e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "missing stdin pipe on native delay dialog".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "missing stdout pipe on native delay dialog".to_string())?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim() == "cancel" {
+                    let _ = tx.send(());
+                    break;
+                }
+            }
+        });
+
+        let handle = NativeDelayHandle {
+            inner: Arc::new(Mutex::new(Some(NativeChild {
+                stdin: Some(stdin),
+                child,
+            }))),
+        };
+        Ok((handle, rx))
+    }
+
+    /// Exibe de forma síncrona o diálogo nativo GTK4/Libadwaita de erro até ser fechado pelo usuário.
+    /// Input: `msg` (`&str`) | Output: `Result<(), String>`
+    pub fn run_error_dialog(msg: &str) -> Result<(), String> {
+        let status = Command::new("python3")
+            .args(["-u", "-c", NATIVE_GTK_SCRIPT, "error", msg])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
-    })
-}
+            .map_err(|e| format!("failed to run native GTK error dialog: {e}"))?;
 
-/// Detecta se o ambiente de desktop prefere tema escuro consultando o portal XDG ou `gsettings`.
-/// Input: nenhum | Output: `bool` (`true` quando `color-scheme` indica preferência por modo escuro)
-pub fn detect_system_dark_theme() -> bool {
-    if let Ok(out) = Command::new("dbus-send")
-        .args([
-            "--reply-timeout=100",
-            "--print-reply=literal",
-            "--dest=org.freedesktop.portal.Desktop",
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.Settings.Read",
-            "string:org.freedesktop.appearance",
-            "string:color-scheme",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            return stdout.trim().ends_with("uint32 1");
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("native GTK error dialog exited with {status}"))
         }
     }
 
-    Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|out| {
-            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("prefer-dark")
-        })
-}
+    /// Abre a janela nativa GTK4/Libadwaita de histórico retornando handle de atualização e canal de eventos.
+    /// Input: nenhum | Output: `Result<(NativeHistoryHandle, mpsc::UnboundedReceiver<NativeHistoryEvent>), String>`
+    pub fn spawn_history_window() -> Result<
+        (
+            NativeHistoryHandle,
+            mpsc::UnboundedReceiver<NativeHistoryEvent>,
+        ),
+        String,
+    > {
+        let mut child = Command::new("python3")
+            .args(["-u", "-c", NATIVE_GTK_SCRIPT, "history"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn native GTK history window: {e}"))?;
 
-/// Abre o diálogo nativo GTK4/Libadwaita `Gravação concluída` retornando handle de controle e receptor de eventos.
-/// Input: `duration_secs` (`u64`), `ext` (`&str`), `default_save_path` (`&Path`) | Output: `Result<(NativeDoneHandle, mpsc::UnboundedReceiver<NativeDoneEvent>), String>`
-pub fn spawn_recording_done(
-    duration_secs: u64,
-    ext: &str,
-    default_save_path: &Path,
-) -> Result<(NativeDoneHandle, mpsc::UnboundedReceiver<NativeDoneEvent>), String> {
-    let duration_arg = duration_secs.to_string();
-    let default_arg = default_save_path.to_string_lossy().into_owned();
-    let mut child = Command::new("python3")
-        .args([
-            "-u",
-            "-c",
-            NATIVE_GTK_SCRIPT,
-            "done",
-            &duration_arg,
-            ext,
-            &default_arg,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to spawn native GTK done dialog: {e}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "missing stdin pipe on native history window".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "missing stdout pipe on native history window".to_string())?;
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "missing stdin pipe on native done dialog".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "missing stdout pipe on native done dialog".to_string())?;
-
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(ev) = parse_done_event(&line) {
-                let _ = tx.send(ev);
+        let (tx, rx) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(ev) = parse_history_event(&line) {
+                    let _ = tx.send(ev);
+                }
             }
-        }
-    });
+        });
 
-    let handle = NativeDoneHandle {
-        inner: Arc::new(Mutex::new(Some(NativeChild {
-            stdin: Some(stdin),
-            child,
-            cleanup_path: None,
-        }))),
-    };
-    Ok((handle, rx))
-}
-
-/// Abre a janela nativa GTK4/Libadwaita da barra flutuante de controle durante a gravação.
-/// Input: `elapsed_secs` (`u64`), `paused` (`bool`), `busy` (`bool`) | Output: `Result<(NativeBarHandle, mpsc::UnboundedReceiver<NativeBarEvent>), String>`
-pub fn spawn_recording_bar(
-    elapsed_secs: u64,
-    paused: bool,
-    busy: bool,
-) -> Result<(NativeBarHandle, mpsc::UnboundedReceiver<NativeBarEvent>), String> {
-    let elapsed_arg = elapsed_secs.to_string();
-    let paused_arg = if paused { "1" } else { "0" };
-    let busy_arg = if busy { "1" } else { "0" };
-    let mut child = Command::new("python3")
-        .args([
-            "-u",
-            "-c",
-            NATIVE_GTK_SCRIPT,
-            "bar",
-            &elapsed_arg,
-            paused_arg,
-            busy_arg,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to spawn native GTK recording bar: {e}"))?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "missing stdin pipe on native recording bar".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "missing stdout pipe on native recording bar".to_string())?;
-
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(ev) = parse_bar_event(&line) {
-                let _ = tx.send(ev);
-            }
-        }
-    });
-
-    let handle = NativeBarHandle {
-        inner: Arc::new(Mutex::new(Some(NativeChild {
-            stdin: Some(stdin),
-            child,
-            cleanup_path: None,
-        }))),
-    };
-    Ok((handle, rx))
-}
-
-/// Interpreta a saída padrão emitida pela janela pré-gravação indicando se a contagem completou ou foi cancelada.
-/// Input: `stdout` (`&str`) | Output: `bool` (`true` quando recebeu `"ready"`, `false` para `"cancel"` ou vazio)
-pub fn parse_toast_outcome(stdout: &str) -> bool {
-    stdout.lines().any(|line| line.trim() == "ready")
-}
-
-/// Exibe a janela nativa GTK4/Libadwaita de contagem regressiva pré-gravação (2 → 1 → 0 s) e aguarda sua conclusão ou cancelamento.
-/// Input: nenhum | Output: `Result<bool, String>` (`Ok(true)` para iniciar gravação, `Ok(false)` se cancelada pelo usuário)
-pub fn run_recording_toast() -> Result<bool, String> {
-    let output = Command::new("python3")
-        .args(["-u", "-c", NATIVE_GTK_SCRIPT, "toast"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to run native GTK toast: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "native GTK toast exited with status {}",
-            output.status
-        ));
+        let handle = NativeHistoryHandle {
+            inner: Arc::new(Mutex::new(Some(NativeChild {
+                stdin: Some(stdin),
+                child,
+            }))),
+        };
+        Ok((handle, rx))
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_toast_outcome(&stdout))
-}
 
-/// Abre o diálogo nativo GTK4/Libadwaita de contagem regressiva retornando handle e canal de cancelamento.
-/// Input: `remaining_secs` (`u8`) | Output: `Result<(NativeDelayHandle, mpsc::UnboundedReceiver<()>), String>`
-pub fn spawn_delay_dialog(
-    remaining_secs: u8,
-) -> Result<(NativeDelayHandle, mpsc::UnboundedReceiver<()>), String> {
-    let secs_arg = remaining_secs.to_string();
-    let mut child = Command::new("python3")
-        .args(["-u", "-c", NATIVE_GTK_SCRIPT, "delay", &secs_arg])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to spawn native GTK delay dialog: {e}"))?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "missing stdin pipe on native delay dialog".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "missing stdout pipe on native delay dialog".to_string())?;
-
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if line.trim() == "cancel" {
-                let _ = tx.send(());
-                break;
-            }
+    /// Cria um par de descritores anônimos `pipe2(..., O_CLOEXEC)` para enviar a imagem PNG sem gravar arquivo em disco.
+    /// Input: nenhum | Output: `Result<(OwnedFd, OwnedFd), String>` com pontas de leitura e escrita.
+    pub(super) fn create_preview_pipe() -> Result<(OwnedFd, OwnedFd), String> {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(format!(
+                "failed to create preview image pipe: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-    });
-
-    let handle = NativeDelayHandle {
-        inner: Arc::new(Mutex::new(Some(NativeChild {
-            stdin: Some(stdin),
-            child,
-            cleanup_path: None,
-        }))),
-    };
-    Ok((handle, rx))
-}
-
-/// Exibe de forma síncrona o diálogo nativo GTK4/Libadwaita de erro até ser fechado pelo usuário.
-/// Input: `msg` (`&str`) | Output: `Result<(), String>`
-pub fn run_error_dialog(msg: &str) -> Result<(), String> {
-    let status = Command::new("python3")
-        .args(["-u", "-c", NATIVE_GTK_SCRIPT, "error", msg])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to run native GTK error dialog: {e}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("native GTK error dialog exited with {status}"))
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        Ok((read_fd, write_fd))
     }
-}
 
-/// Abre a janela nativa GTK4/Libadwaita de histórico retornando handle de atualização e canal de eventos.
-/// Input: nenhum | Output: `Result<(NativeHistoryHandle, mpsc::UnboundedReceiver<NativeHistoryEvent>), String>`
-pub fn spawn_history_window() -> Result<
-    (
-        NativeHistoryHandle,
-        mpsc::UnboundedReceiver<NativeHistoryEvent>,
-    ),
-    String,
-> {
-    let mut child = Command::new("python3")
-        .args(["-u", "-c", NATIVE_GTK_SCRIPT, "history"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to spawn native GTK history window: {e}"))?;
+    /// Abre a janela nativa GTK4/Libadwaita do editor enviando a prévia PNG em memória por pipe anônimo dedicado.
+    /// Input: `base_rgba` (`&[u8]`), `width` (`u32`), `height` (`u32`), `dark` (`bool`) | Output: `Result<(NativeEditorHandle, mpsc::UnboundedReceiver<NativeEditorEvent>), String>`
+    pub fn spawn_editor_window(
+        base_rgba: &[u8],
+        width: u32,
+        height: u32,
+        dark: bool,
+    ) -> Result<
+        (
+            NativeEditorHandle,
+            mpsc::UnboundedReceiver<NativeEditorEvent>,
+        ),
+        String,
+    > {
+        let png_bytes =
+            encode_rgba(base_rgba, width, height, ExportFormat::Png).map_err(|e| e.to_string())?;
+        let (read_fd, write_fd) = create_preview_pipe()?;
+        let read_raw = read_fd.as_raw_fd();
+        let fd_arg = read_raw.to_string();
+        let w_arg = width.to_string();
+        let h_arg = height.to_string();
+        let dark_arg = if dark { "1" } else { "0" };
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "missing stdin pipe on native history window".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "missing stdout pipe on native history window".to_string())?;
-
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(ev) = parse_history_event(&line) {
-                let _ = tx.send(ev);
-            }
-        }
-    });
-
-    let handle = NativeHistoryHandle {
-        inner: Arc::new(Mutex::new(Some(NativeChild {
-            stdin: Some(stdin),
-            child,
-            cleanup_path: None,
-        }))),
-    };
-    Ok((handle, rx))
-}
-
-/// Grava a imagem base RGBA em um arquivo PNG temporário restrito (`0o600`) para exibição no editor nativo.
-/// Input: `base_rgba` (`&[u8]`), `width` (`u32`), `height` (`u32`) | Output: `Result<PathBuf, String>`
-fn write_editor_preview_png(base_rgba: &[u8], width: u32, height: u32) -> Result<PathBuf, String> {
-    let png_bytes =
-        encode_rgba(base_rgba, width, height, ExportFormat::Png).map_err(|e| e.to_string())?;
-    let dir = ProjectDirs::from("io.github", "lx_snippingtool", "lx-snippingtool")
-        .map(|p| p.cache_dir().join("preview"))
-        .unwrap_or_else(|| std::env::temp_dir().join("lx-snippingtool-preview"));
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("editor_{}.png", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| e.to_string())?;
-    file.write_all(&png_bytes).map_err(|e| e.to_string())?;
-    Ok(path)
-}
-
-/// Abre a janela nativa GTK4/Libadwaita do editor de anotações para a imagem RGBA informada.
-/// Input: `base_rgba` (`&[u8]`), `width` (`u32`), `height` (`u32`), `dark` (`bool`) | Output: `Result<(NativeEditorHandle, mpsc::UnboundedReceiver<NativeEditorEvent>), String>`
-pub fn spawn_editor_window(
-    base_rgba: &[u8],
-    width: u32,
-    height: u32,
-    dark: bool,
-) -> Result<
-    (
-        NativeEditorHandle,
-        mpsc::UnboundedReceiver<NativeEditorEvent>,
-    ),
-    String,
-> {
-    let preview_png = write_editor_preview_png(base_rgba, width, height)?;
-    let png_arg = preview_png.to_string_lossy().into_owned();
-    let w_arg = width.to_string();
-    let h_arg = height.to_string();
-    let dark_arg = if dark { "1" } else { "0" };
-
-    let mut child = match Command::new("python3")
-        .args([
+        let mut cmd = Command::new("python3");
+        cmd.args([
             "-u",
             "-c",
             NATIVE_GTK_SCRIPT,
             "editor",
-            &png_arg,
+            &fd_arg,
             &w_arg,
             &h_arg,
             dark_arg,
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = fs::remove_file(&preview_png);
-            return Err(format!("failed to spawn native GTK editor window: {e}"));
+        .stderr(Stdio::null());
+
+        // SAFETY: limpa apenas FD_CLOEXEC do descritor de leitura do pipe para que o processo GTK possa lê-lo;
+        // a ponta de escrita permanece O_CLOEXEC e fechada no filho.
+        unsafe {
+            cmd.pre_exec(move || {
+                let flags = libc::fcntl(read_raw, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(read_raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
+                Ok(())
+            });
         }
-    };
 
-    let Some(stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = fs::remove_file(&preview_png);
-        return Err("missing stdin pipe on native editor window".to_string());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = fs::remove_file(&preview_png);
-        return Err("missing stdout pipe on native editor window".to_string());
-    };
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn native GTK editor window: {e}"))?;
 
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(ev) = parse_editor_event(&line) {
-                let _ = tx.send(ev);
+        // Fecha a ponta de leitura no processo pai e envia os bytes na thread de escrita até EOF.
+        drop(read_fd);
+        std::thread::spawn(move || {
+            let mut writer = File::from(write_fd);
+            let _ = writer.write_all(&png_bytes);
+        });
+
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("missing stdin pipe on native editor window".to_string());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("missing stdout pipe on native editor window".to_string());
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(ev) = parse_editor_event(&line) {
+                    let _ = tx.send(ev);
+                }
             }
-        }
-    });
+        });
 
-    let handle = NativeEditorHandle {
-        inner: Arc::new(Mutex::new(Some(NativeChild {
-            stdin: Some(stdin),
-            child,
-            cleanup_path: Some(preview_png),
-        }))),
-    };
-    Ok((handle, rx))
+        let handle = NativeEditorHandle {
+            inner: Arc::new(Mutex::new(Some(NativeChild {
+                stdin: Some(stdin),
+                child,
+            }))),
+        };
+        Ok((handle, rx))
+    }
 }
 
-#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub use linux_native::*;
+
+#[cfg(not(target_os = "linux"))]
+mod non_linux_native {
+    use std::path::Path;
+
+    use lx_snip_core::scene::AnnotationScene;
+    use lx_snip_core::storage::SnipEntry;
+    use tokio::sync::mpsc;
+
+    use super::{NativeBarEvent, NativeDoneEvent, NativeEditorEvent, NativeHistoryEvent};
+
+    /// Stub multiplataforma para controle do diálogo `Gravação concluída` fora do Linux.
+    /// Armazena: estrutura unitária sem campos | Principais métodos: `send_close`, `send_idle`, `send_error`.
+    #[derive(Clone, Default)]
+    pub struct NativeDoneHandle;
+
+    impl NativeDoneHandle {
+        /// Operação nula fora do Linux (a janela Iced gerencia o ciclo de vida).
+        /// Input: `&self` | Output: nenhum (`()`).
+        pub fn send_close(&self) {}
+
+        /// Operação nula fora do Linux.
+        /// Input: `&self` | Output: nenhum (`()`).
+        pub fn send_idle(&self) {}
+
+        /// Operação nula fora do Linux.
+        /// Input: `&self` e `_msg` (`&str`) | Output: nenhum (`()`).
+        pub fn send_error(&self, _msg: &str) {}
+    }
+
+    /// Stub multiplataforma para controle da barra de gravação fora do Linux.
+    /// Armazena: estrutura unitária sem campos | Principais métodos: `update`, `close`.
+    #[derive(Clone, Default)]
+    pub struct NativeBarHandle;
+
+    impl NativeBarHandle {
+        /// Operação nula fora do Linux.
+        /// Input: `&self`, `_elapsed_secs`, `_paused` e `_busy` | Output: nenhum (`()`).
+        pub fn update(&self, _elapsed_secs: u64, _paused: bool, _busy: bool) {}
+
+        /// Operação nula fora do Linux.
+        /// Input: `&self` | Output: nenhum (`()`).
+        pub fn close(&self) {}
+    }
+
+    /// Stub multiplataforma para diálogo de atraso antes da captura fora do Linux.
+    /// Armazena: estrutura unitária sem campos | Principais métodos: `update_secs`, `close`.
+    #[derive(Clone, Default)]
+    pub struct NativeDelayHandle;
+
+    impl NativeDelayHandle {
+        /// Operação nula fora do Linux.
+        /// Input: `&self` e `_remaining_secs` (`u8`) | Output: nenhum (`()`).
+        pub fn update_secs(&self, _remaining_secs: u8) {}
+
+        /// Operação nula fora do Linux.
+        /// Input: `&self` | Output: nenhum (`()`).
+        pub fn close(&self) {}
+    }
+
+    /// Stub multiplataforma para janela nativa de histórico fora do Linux.
+    /// Armazena: estrutura unitária sem campos | Principais métodos: `sync_items`, `close`.
+    #[derive(Clone, Default)]
+    pub struct NativeHistoryHandle;
+
+    impl NativeHistoryHandle {
+        /// Operação nula fora do Linux.
+        /// Input: `&self`, `_entries` e `_status` | Output: nenhum (`()`).
+        pub fn sync_items(&self, _entries: &[SnipEntry], _status: Option<&str>) {}
+
+        /// Operação nula fora do Linux.
+        /// Input: `&self` | Output: nenhum (`()`).
+        pub fn close(&self) {}
+    }
+
+    /// Stub multiplataforma para janela nativa do editor fora do Linux.
+    /// Armazena: estrutura unitária sem campos | Principais métodos: `sync_scene`, `close`.
+    #[derive(Clone, Default)]
+    pub struct NativeEditorHandle;
+
+    impl NativeEditorHandle {
+        /// Operação nula fora do Linux.
+        /// Input: `&self`, `_scene` e `_status` | Output: nenhum (`()`).
+        pub fn sync_scene(&self, _scene: &AnnotationScene, _status: Option<&str>) {}
+
+        /// Operação nula fora do Linux.
+        /// Input: `&self` | Output: nenhum (`()`).
+        pub fn close(&self) {}
+    }
+
+    /// Desativa janelas GTK/Python fora do Linux priorizando sempre a interface nativa Iced.
+    /// Input: nenhum | Output: `false`.
+    pub fn should_use_native_gtk() -> bool {
+        false
+    }
+
+    /// Desativa o editor GTK/Python fora do Linux usando o editor `iced` integrado.
+    /// Input: nenhum | Output: `false`.
+    pub fn should_use_native_gtk_editor() -> bool {
+        false
+    }
+
+    /// Detecta se o Windows 11 está configurado para modo escuro via chave `AppsUseLightTheme` do Registro.
+    /// Input: nenhum | Output: `bool` (`true` se tema escuro ativo).
+    #[cfg(target_os = "windows")]
+    pub fn detect_system_dark_theme() -> bool {
+        use std::ffi::c_void;
+        use windows::core::HSTRING;
+        use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+
+        let subkey = HSTRING::from(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+        let value = HSTRING::from("AppsUseLightTheme");
+        let mut data: u32 = 1;
+        let mut size: u32 = std::mem::size_of::<u32>() as u32;
+        let ok = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                &subkey,
+                &value,
+                RRF_RT_REG_DWORD,
+                None,
+                Some((&mut data as *mut u32) as *mut c_void),
+                Some(&mut size),
+            )
+        };
+        ok.is_ok() && data == 0
+    }
+
+    /// Retorna tema claro padrão quando compilado em plataformas sem GTK nem Registro do Windows.
+    /// Input: nenhum | Output: `false`.
+    #[cfg(not(target_os = "windows"))]
+    pub fn detect_system_dark_theme() -> bool {
+        false
+    }
+
+    /// Informa indisponibilidade do diálogo GTK fora do Linux acionando fallback em `iced`.
+    /// Input: `_duration_secs`, `_ext`, `_default_save_path` | Output: `Err` indicando fallback para `iced`.
+    pub fn spawn_recording_done(
+        _duration_secs: u64,
+        _ext: &str,
+        _default_save_path: &Path,
+    ) -> Result<(NativeDoneHandle, mpsc::UnboundedReceiver<NativeDoneEvent>), String> {
+        Err("GTK native UI disabled on this platform".to_string())
+    }
+
+    /// Informa indisponibilidade da barra GTK fora do Linux acionando fallback em `iced`.
+    /// Input: `_elapsed_secs`, `_paused`, `_busy` | Output: `Err` indicando fallback para `iced`.
+    pub fn spawn_recording_bar(
+        _elapsed_secs: u64,
+        _paused: bool,
+        _busy: bool,
+    ) -> Result<(NativeBarHandle, mpsc::UnboundedReceiver<NativeBarEvent>), String> {
+        Err("GTK native UI disabled on this platform".to_string())
+    }
+
+    /// Contagem regressiva imediata sem toast GTK fora do Linux.
+    /// Input: nenhum | Output: `Ok(true)`.
+    pub fn run_recording_toast() -> Result<bool, String> {
+        Ok(true)
+    }
+
+    /// Informa indisponibilidade do diálogo GTK de atraso fora do Linux acionando fallback em `iced`.
+    /// Input: `_remaining_secs` (`u8`) | Output: `Err` indicando fallback para `iced`.
+    pub fn spawn_delay_dialog(
+        _remaining_secs: u8,
+    ) -> Result<(NativeDelayHandle, mpsc::UnboundedReceiver<()>), String> {
+        Err("GTK native UI disabled on this platform".to_string())
+    }
+
+    /// Informa indisponibilidade do diálogo GTK de erro fora do Linux acionando fallback em `iced`.
+    /// Input: `_msg` (`&str`) | Output: `Err` indicando fallback para `iced`.
+    pub fn run_error_dialog(_msg: &str) -> Result<(), String> {
+        Err("GTK native UI disabled on this platform".to_string())
+    }
+
+    /// Informa indisponibilidade da janela GTK de histórico fora do Linux acionando fallback em `iced`.
+    /// Input: nenhum | Output: `Err` indicando fallback para `iced`.
+    pub fn spawn_history_window() -> Result<
+        (
+            NativeHistoryHandle,
+            mpsc::UnboundedReceiver<NativeHistoryEvent>,
+        ),
+        String,
+    > {
+        Err("GTK native UI disabled on this platform".to_string())
+    }
+
+    /// Informa indisponibilidade do editor GTK fora do Linux acionando o editor `iced`.
+    /// Input: `_base_rgba`, `_width`, `_height`, `_dark` | Output: `Err` indicando fallback para `iced`.
+    pub fn spawn_editor_window(
+        _base_rgba: &[u8],
+        _width: u32,
+        _height: u32,
+        _dark: bool,
+    ) -> Result<
+        (
+            NativeEditorHandle,
+            mpsc::UnboundedReceiver<NativeEditorEvent>,
+        ),
+        String,
+    > {
+        Err("GTK native UI disabled on this platform".to_string())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub use non_linux_native::*;
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
     use super::*;
-    use lx_snip_core::scene::{Color, Point, ShapeKind};
+    use lx_snip_core::export::{encode_rgba, ExportFormat};
+    use lx_snip_core::scene::{Color, LineStyle, Point, ShapeKind};
+
+    use super::linux_native::create_preview_pipe;
 
     #[test]
     fn parses_done_events() {
@@ -958,6 +1186,7 @@ mod tests {
                 points: vec![Point::new(1.0, 2.0)],
                 color: Color::RED,
                 width: 4.0,
+                style: LineStyle::Solid,
             }))
         );
 
@@ -970,6 +1199,45 @@ mod tests {
                 end: Point::new(20.0, 10.0),
                 color: Color::BLACK,
                 width: 2.0,
+                style: LineStyle::Solid,
+            }))
+        );
+
+        let double_arrow_json = r#"{"cmd":"push_op","op":{"Shape":{"kind":"DoubleArrow","start":{"x":0.0,"y":0.0},"end":{"x":20.0,"y":10.0},"color":{"r":0,"g":0,"b":0,"a":255},"width":2.0,"style":"Dashed"}}}"#;
+        assert_eq!(
+            parse_editor_event(double_arrow_json),
+            Some(NativeEditorEvent::PushOp(AnnotationOp::Shape {
+                kind: ShapeKind::DoubleArrow,
+                start: Point::new(0.0, 0.0),
+                end: Point::new(20.0, 10.0),
+                color: Color::BLACK,
+                width: 2.0,
+                style: LineStyle::Dashed,
+            }))
+        );
+
+        let spray_json = r#"{"cmd":"push_op","op":{"Spray":{"points":[{"x":5.0,"y":5.0}],"color":{"r":220,"g":38,"b":38,"a":255},"radius":12.0}}}"#;
+        assert_eq!(
+            parse_editor_event(spray_json),
+            Some(NativeEditorEvent::PushOp(AnnotationOp::Spray {
+                points: vec![Point::new(5.0, 5.0)],
+                color: Color::RED,
+                radius: 12.0,
+            }))
+        );
+
+        let curve_json = r#"{"cmd":"push_op","op":{"CurvedLine":{"points":[{"x":2.0,"y":12.0},{"x":10.0,"y":4.0},{"x":22.0,"y":12.0}],"color":{"r":220,"g":38,"b":38,"a":255},"width":4.0,"style":"Dotted"}}}"#;
+        assert_eq!(
+            parse_editor_event(curve_json),
+            Some(NativeEditorEvent::PushOp(AnnotationOp::CurvedLine {
+                points: vec![
+                    Point::new(2.0, 12.0),
+                    Point::new(10.0, 4.0),
+                    Point::new(22.0, 12.0)
+                ],
+                color: Color::RED,
+                width: 4.0,
+                style: LineStyle::Dotted,
             }))
         );
 
@@ -1061,5 +1329,48 @@ mod tests {
                 String::from_utf8_lossy(&status.stderr)
             );
         }
+    }
+
+    #[test]
+    fn preview_png_loads_via_pipe_into_pycairo_without_cache_files() {
+        let rgba = vec![128u8; 4 * 4 * 4];
+        let png_bytes = encode_rgba(&rgba, 4, 4, ExportFormat::Png).unwrap();
+        let (read_fd, write_fd) = create_preview_pipe().expect("pipe2 should succeed");
+        let read_raw = read_fd.as_raw_fd();
+
+        let py_check = r#"
+import cairo, io, os, sys
+with os.fdopen(int(sys.argv[1]), "rb", closefd=True) as f:
+    data = f.read()
+surf = cairo.ImageSurface.create_from_png(io.BytesIO(data))
+assert surf.get_width() == 4 and surf.get_height() == 4
+"#;
+        let mut cmd = Command::new("python3");
+        cmd.args(["-c", py_check, &read_raw.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        unsafe {
+            cmd.pre_exec(move || {
+                let flags = libc::fcntl(read_raw, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(read_raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().expect("python3 must spawn");
+        drop(read_fd);
+
+        std::thread::spawn(move || {
+            let mut w = File::from(write_fd);
+            let _ = w.write_all(&png_bytes);
+        });
+
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "pycairo pipe read failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

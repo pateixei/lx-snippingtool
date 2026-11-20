@@ -1,33 +1,25 @@
 //! Módulo: `capture_x11`
-//! Objetivos: Capturar a área de trabalho e enumerar janelas e monitores no servidor X11 via XShm, GetImage, RandR e `_NET_CLIENT_LIST`.
-//! Principais itens: `X11WindowBounds`, `X11CaptureBackend`, `list_x11_windows`, `capture_via_shm` e `query_randr_outputs`.
-//! Última alteração: 2026-11-19
+//! Objetivos: Capturar a área de trabalho e enumerar janelas e monitores no servidor X11 via `memfd_create`+XShm, GetImage, RandR e `_NET_CLIENT_LIST`.
+//! Principais itens: `X11WindowBounds`, `X11CaptureBackend`, `list_x11_windows`, `query_x11_window_size`, `capture_via_shm` e `query_randr_outputs`.
+//! Última alteração: 2026-11-20
 
-use std::fs::OpenOptions;
-use std::os::unix::io::OwnedFd;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::io::{FromRawFd, OwnedFd};
 
 use lx_snip_core::platform::{
-    CaptureBackend, CapturedImage, OutputGeometry, PlatformError, PlatformFuture,
+    CaptureBackend, CapturedImage, OutputGeometry, PlatformError, PlatformFuture, WindowBounds,
 };
 use lx_snip_core::scene::Rect;
 use tracing::{debug, warn};
-use uuid::Uuid;
 use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
 use x11rb::protocol::shm::{self, ConnectionExt as ShmExt};
 use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt as XprotoExt, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
 
-/// Representa o identificador e o retângulo delimitador de uma janela X11 visível.
-/// Armazena: identificador `window` e `rect` em coordenadas root | Principais métodos: nenhum (tipo de dados).
-#[derive(Debug, Clone)]
-pub struct X11WindowBounds {
-    /// Identificador da janela X11.
-    #[allow(dead_code)]
-    pub window: Window,
-    /// Retângulo delimitador na tela em coordenadas globais X11.
-    pub rect: Rect,
-}
+/// Reexporta `WindowBounds` como alias compatível para janelas enumeradas no X11.
+pub type X11WindowBounds = WindowBounds;
 
 /// Implementa o backend de captura de tela X11 com XShm, RandR e lista de janelas.
 /// Armazena: estrutura unitária sem campos | Principais métodos: `new`, `supports_window_mode`, `capture_desktop`, `capture_window`.
@@ -115,8 +107,8 @@ pub fn list_x11_windows() -> Result<Vec<X11WindowBounds>, PlatformError> {
         if geom.width == 0 || geom.height == 0 {
             continue;
         }
-        windows.push(X11WindowBounds {
-            window: win,
+        windows.push(WindowBounds {
+            id: u64::from(win),
             rect: Rect::new(
                 f32::from(trans.dst_x),
                 f32::from(trans.dst_y),
@@ -196,19 +188,7 @@ fn capture_via_shm(
     }
 
     let byte_len = usize::from(width) * usize::from(height) * 4;
-    let shm_path = std::env::temp_dir().join(format!("lx-snip-shm-{}", Uuid::new_v4()));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&shm_path)
-        .map_err(|e| {
-            PlatformError::CaptureFailed(format!("failed to create shm backing file: {e}"))
-        })?;
-    // Unlink immediately so the backing file is cleaned up even on crash.
-    let _ = std::fs::remove_file(&shm_path);
-    file.set_len(byte_len as u64)
-        .map_err(|e| PlatformError::CaptureFailed(format!("failed to size shm file: {e}")))?;
+    let mut file = create_anonymous_shm_file(byte_len)?;
 
     let dup_fd = file
         .try_clone()
@@ -248,15 +228,63 @@ fn capture_via_shm(
         )));
     }
 
-    use std::io::Read;
-    let mut file_reader = file;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| PlatformError::CaptureFailed(format!("failed to rewind shm buffer: {e}")))?;
     let mut buf = vec![0u8; byte_len];
-    file_reader
-        .read_exact(&mut buf)
+    file.read_exact(&mut buf)
         .map_err(|e| PlatformError::CaptureFailed(format!("failed to read shm buffer: {e}")))?;
 
     let _ = shm::CompletionEvent::default();
     Ok(buf)
+}
+
+/// Cria buffer de memória anônimo via `memfd_create` com `MFD_CLOEXEC` e tamanho `byte_len`.
+/// Input: tamanho `byte_len` em bytes | Output: `Result<File, PlatformError>` sem entrada no sistema de arquivos.
+fn create_anonymous_shm_file(byte_len: usize) -> Result<File, PlatformError> {
+    let raw_fd = unsafe { libc::memfd_create(c"lx-snip-shm".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw_fd < 0 {
+        return Err(PlatformError::CaptureFailed(format!(
+            "memfd_create failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let file = File::from(owned);
+    file.set_len(byte_len as u64).map_err(|e| {
+        PlatformError::CaptureFailed(format!("failed to size anonymous shm buffer: {e}"))
+    })?;
+    Ok(file)
+}
+
+/// Consulta os atributos e a geometria atual de uma janela X11 pelo seu `xid`.
+/// Input: `xid` (`u32`) da janela | Output: `Result<(u32, u32), PlatformError>` com largura e altura ou erro se indisponível.
+pub fn query_x11_window_size(xid: u32) -> Result<(u32, u32), PlatformError> {
+    let (conn, _screen_num) = x11rb::connect(None).map_err(|e| {
+        PlatformError::CaptureFailed(format!("failed to connect X11 for window query: {e}"))
+    })?;
+    let attrs = conn
+        .get_window_attributes(xid)
+        .map_err(|e| PlatformError::CaptureFailed(format!("get_window_attributes failed: {e}")))?
+        .reply()
+        .map_err(|e| PlatformError::CaptureFailed(format!("window 0x{xid:x} unavailable: {e}")))?;
+    if attrs.map_state != xproto::MapState::VIEWABLE {
+        return Err(PlatformError::CaptureFailed(format!(
+            "X11 window 0x{xid:x} is no longer viewable"
+        )));
+    }
+    let geom = conn
+        .get_geometry(xid)
+        .map_err(|e| PlatformError::CaptureFailed(format!("get_geometry failed: {e}")))?
+        .reply()
+        .map_err(|e| {
+            PlatformError::CaptureFailed(format!("window 0x{xid:x} geometry error: {e}"))
+        })?;
+    if geom.width == 0 || geom.height == 0 {
+        return Err(PlatformError::CaptureFailed(format!(
+            "X11 window 0x{xid:x} has zero dimensions"
+        )));
+    }
+    Ok((u32::from(geom.width), u32::from(geom.height)))
 }
 
 /// Realiza captura de fallback via chamada X11 padrão `GetImage` quando XShm falha.
@@ -348,5 +376,41 @@ fn fallback_output(width: u32, height: u32) -> OutputGeometry {
         width,
         height,
         scale_factor: 1.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn anonymous_shm_memfd_has_cloexec_and_exact_size_without_tmp_file() {
+        let before_count = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("lx-snip-shm-"))
+            .count();
+
+        let mut file = create_anonymous_shm_file(4096).expect("memfd_create should succeed");
+        assert_eq!(file.metadata().unwrap().len(), 4096);
+
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "FD_CLOEXEC must be set");
+
+        file.write_all(&[0xAA; 16]).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut head = [0u8; 16];
+        file.read_exact(&mut head).unwrap();
+        assert_eq!(head, [0xAA; 16]);
+
+        let after_count = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("lx-snip-shm-"))
+            .count();
+        assert_eq!(before_count, after_count);
     }
 }

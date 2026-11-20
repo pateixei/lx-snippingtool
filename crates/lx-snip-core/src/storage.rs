@@ -1,11 +1,12 @@
 //! Módulo: `storage`
-//! Objetivos: Gerenciar o armazenamento local limitado de capturas PNG e tokens do portal `ScreenCast` com permissões restritas (`0700`/`0600`).
+//! Objetivos: Gerenciar o armazenamento local limitado de capturas PNG e tokens do portal `ScreenCast` com permissões restritas (`0700`/`0600` em Unix).
 //! Principais itens: `SnipEntry`, `StorageError`, `SnipStore` e `TokenStore`.
-//! Última alteração: 2026-11-19
+//! Última alteração: 2026-11-20
 
 use std::cmp::Ordering;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -77,15 +78,15 @@ impl SnipStore {
         self.max_items
     }
 
-    /// Garante que o diretório de capturas exista com permissão restrita `0700`.
+    /// Garante que o diretório de capturas exista com permissão restrita (`0700` em Unix).
     /// Input: `&self` | Output: `Result<(), StorageError>`.
     pub fn ensure_dir(&self) -> Result<(), StorageError> {
         fs::create_dir_all(&self.dir)?;
-        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
+        set_restricted_dir_permissions(&self.dir)?;
         Ok(())
     }
 
-    /// Salva bytes PNG com permissão `0600` e remove arquivos excedentes além de `max_items`.
+    /// Salva bytes PNG com permissão restrita e remove arquivos excedentes além de `max_items`.
     /// Input: `&self` e slice `png_bytes` | Output: `Result<PathBuf, StorageError>` com o caminho criado.
     pub fn save_png(&self, png_bytes: &[u8]) -> Result<PathBuf, StorageError> {
         self.ensure_dir()?;
@@ -97,15 +98,11 @@ impl SnipStore {
         let filename = format!("{unix_ms}_{}.png", Uuid::new_v4());
         let dest_path = self.dir.join(filename);
 
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&dest_path)?;
+        let mut file = open_restricted_new_file(&dest_path)?;
         file.write_all(png_bytes)?;
         file.sync_all()?;
-        // Explicitly set 0600 in case process umask masked bits or filesystem adjusted defaults.
-        fs::set_permissions(&dest_path, fs::Permissions::from_mode(0o600))?;
+        // Explicitly set 0600 on Unix in case process umask masked bits or filesystem adjusted defaults.
+        set_restricted_file_permissions(&dest_path)?;
 
         self.prune()?;
         Ok(dest_path)
@@ -218,26 +215,62 @@ impl TokenStore {
         }
     }
 
-    /// Persiste `tokens.json` atomicamente com permissões `0700` no diretório e `0600` no arquivo.
+    /// Persiste `tokens.json` atomicamente com permissões restritas (`0700`/`0600` em Unix).
     /// Input: `&self` | Output: `Result<(), StorageError>`.
     pub fn save_default(&self) -> Result<(), StorageError> {
         let path = Self::default_path()?;
         let parent = path.parent().ok_or(StorageError::NoDataDir)?;
         fs::create_dir_all(parent)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        set_restricted_dir_permissions(parent)?;
 
         let tmp = parent.join(format!("tokens.json.tmp.{}", Uuid::new_v4()));
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut file = open_restricted_new_file(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        set_restricted_file_permissions(&tmp)?;
         fs::rename(&tmp, &path)?;
         Ok(())
     }
+}
+
+/// Aplica permissão `0700` ao diretório em sistemas Unix e mantém o padrão da conta do usuário nos demais.
+/// Input: `dir` (`&Path`) | Output: `std::io::Result<()>`.
+fn set_restricted_dir_permissions(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// Abre exclusivamente um novo arquivo para escrita com modo `0600` em Unix ou ACL padrão do usuário fora do Unix.
+/// Input: `path` (`&Path`) | Output: `std::io::Result<File>`.
+fn open_restricted_new_file(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Aplica permissão `0600` ao arquivo criado em sistemas Unix e mantém ACL padrão fora do Unix.
+/// Input: `path` (`&Path`) | Output: `std::io::Result<()>`.
+fn set_restricted_file_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }

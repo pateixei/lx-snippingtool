@@ -1,6 +1,6 @@
 //! Módulo: `capture_wayland`
-//! Objetivos: Capturar quadros e abrir sessões de gravação em Wayland via portal `ScreenCast` (`ashpd`), `restore_token`, PipeWire e `wl_output`/`xdg-output`, sem fallback `Screenshot`.
-//! Principais itens: `PortalCaptureBackend`, `WaylandSource`, `WaylandScreencastSession`, `open_screencast_session_for`, `query_wayland_outputs`, `trim_transparent_border`
+//! Objetivos: Capturar quadros e abrir sessões de gravação em Wayland via portal `ScreenCast` (`ashpd`), vinculando fonte/resolução, validando `spa_chunk` do PipeWire e sem fallback `Screenshot`.
+//! Principais itens: `PortalCaptureBackend`, `WaylandSource`, `WaylandSourceBinding`, `WaylandScreencastSession`, `capture_desktop_with_binding`, `open_screencast_session_for`, `query_wayland_outputs`, `trim_transparent_border`
 //! Última alteração: 2026-11-19
 
 use std::cell::Cell;
@@ -27,6 +27,7 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zx
 
 const APP_ID: &str = "io.github.lx_snippingtool.SnippingTool";
 const PIPEWIRE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_FRAME_RGBA_BYTES: usize = 256 * 1024 * 1024;
 
 /// Backend de captura de tela para Wayland baseado no portal XDG `ScreenCast` e PipeWire.
 /// Armazena: unidade sem estado (unit struct) | Principais métodos: `new`, `supports_window_mode`, `capture_desktop`, `capture_window`
@@ -111,8 +112,64 @@ impl WaylandSource {
     }
 }
 
+/// Metadados da fonte negociada pelo portal XDG `ScreenCast` para vincular captura inicial e gravação em Wayland.
+/// Armazena: `source_type`, `stream_id`, `mapping_id`, `position`, `logical_size`, `pixel_width`, `pixel_height` | Principais métodos: `validate_session`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaylandSourceBinding {
+    /// Tipo de origem reportado pelo portal (`Monitor` ou `Window`).
+    pub source_type: Option<SourceType>,
+    /// Identificador do stream reportado pelo portal.
+    pub stream_id: Option<String>,
+    /// Identificador persistente de mapeamento da fonte no compositor.
+    pub mapping_id: Option<String>,
+    /// Posição lógica `(x, y)` da origem, quando informada pelo portal.
+    pub position: Option<(i32, i32)>,
+    /// Dimensões lógicas `(width, height)`, quando informadas pelo portal.
+    pub logical_size: Option<(i32, i32)>,
+    /// Largura real em pixels negociada no quadro capturado.
+    pub pixel_width: u32,
+    /// Altura real em pixels negociada no quadro capturado.
+    pub pixel_height: u32,
+}
+
+impl WaylandSourceBinding {
+    /// Valida se a sessão `ScreenCast` recém-aberta corresponde à mesma fonte e geometria vinculada na seleção.
+    /// Input: `&self` e `session` (`&WaylandScreencastSession`) | Output: `Result<(), String>`.
+    pub fn validate_session(&self, session: &WaylandScreencastSession) -> Result<(), String> {
+        if let (Some(expected), Some(actual)) = (self.source_type, session.source_type) {
+            if expected != actual {
+                return Err(format!(
+                    "fonte Wayland incompatível: esperado {expected:?}, recebido {actual:?}"
+                ));
+            }
+        }
+        if let (Some(expected), Some(actual)) = (&self.mapping_id, &session.mapping_id) {
+            if expected != actual {
+                return Err(format!(
+                    "monitor/origem Wayland alterado entre seleção e gravação ({expected} != {actual})"
+                ));
+            }
+        }
+        if let (Some(expected), Some(actual)) = (self.logical_size, session.logical_size) {
+            if expected != actual {
+                return Err(format!(
+                    "resolução lógica da fonte Wayland alterada ({expected:?} != {actual:?})"
+                ));
+            }
+        }
+        if let (Some(expected), Some(actual)) = (self.position, session.position) {
+            if expected != actual {
+                return Err(format!(
+                    "posição lógica da fonte Wayland alterada ({expected:?} != {actual:?})"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Sessão `ScreenCast` ativa no portal Wayland para gravação de tela contínua.
-/// Armazena: `pw_fd`, `node_id`, `had_saved_token`, `proxy`, `session` | Principais métodos: `reopen_pipewire_remote`, `close`
+/// Armazena: `pw_fd`, `node_id`, `had_saved_token`, `source_type`, `stream_id`, `mapping_id`, `position`, `logical_size`, `proxy`, `session` | Principais métodos: `reopen_pipewire_remote`, `close`
 pub struct WaylandScreencastSession {
     /// PipeWire remote fd to pass to `pipewiresrc`.
     pub pw_fd: OwnedFd,
@@ -120,6 +177,16 @@ pub struct WaylandScreencastSession {
     pub node_id: u32,
     /// Whether a previously saved `restore_token` existed before starting this session.
     pub had_saved_token: bool,
+    /// Tipo de origem selecionado para este stream.
+    pub source_type: Option<SourceType>,
+    /// Identificador do stream reportado pelo portal.
+    pub stream_id: Option<String>,
+    /// Identificador persistente de mapeamento da fonte, quando disponível.
+    pub mapping_id: Option<String>,
+    /// Posição lógica da origem reportada pelo portal.
+    pub position: Option<(i32, i32)>,
+    /// Dimensões lógicas da origem reportadas pelo portal.
+    pub logical_size: Option<(i32, i32)>,
     proxy: Screencast<'static>,
     session: ashpd::desktop::Session<'static, Screencast<'static>>,
 }
@@ -206,6 +273,11 @@ async fn open_screencast_session_with_options(
         )
     })?;
     let node_id = stream.pipe_wire_node_id();
+    let stream_source_type = stream.source_type();
+    let stream_id = stream.id().map(ToString::to_string);
+    let mapping_id = stream.mapping_id().map(ToString::to_string);
+    let position = stream.position();
+    let logical_size = stream.size();
 
     let pw_fd = proxy.open_pipe_wire_remote(&session).await.map_err(|err| {
         PlatformError::CaptureFailed(format!(
@@ -217,9 +289,21 @@ async fn open_screencast_session_with_options(
         pw_fd,
         node_id,
         had_saved_token,
+        source_type: stream_source_type,
+        stream_id,
+        mapping_id,
+        position,
+        logical_size,
         proxy,
         session,
     })
+}
+
+/// Captura o monitor em Wayland retornando tanto a imagem quanto o vínculo (`WaylandSourceBinding`) negociado no portal.
+/// Input: nenhum | Output: `Result<(CapturedImage, WaylandSourceBinding), PlatformError>`.
+pub async fn capture_desktop_with_binding(
+) -> Result<(CapturedImage, WaylandSourceBinding), PlatformError> {
+    capture_via_screencast_with_binding(SourceType::Monitor).await
 }
 
 /// Abre uma sessão `ScreenCast` persistente no portal (reaproveitando `restore_token` em monitores) para gravação de vídeo com cursor embutido.
@@ -233,10 +317,24 @@ pub async fn open_screencast_session_for(
 /// Realiza a captura de um único quadro via sessão temporária do portal ScreenCast e PipeWire.
 /// Input: `source_type` (`SourceType`) | Output: `Result<CapturedImage, PlatformError>`
 async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage, PlatformError> {
+    let (img, _binding) = capture_via_screencast_with_binding(source_type).await?;
+    Ok(img)
+}
+
+/// Realiza captura via portal `ScreenCast` retornando a imagem e os metadados de vinculação da fonte.
+/// Input: `source_type` (`SourceType`) | Output: `Result<(CapturedImage, WaylandSourceBinding), PlatformError>`.
+async fn capture_via_screencast_with_binding(
+    source_type: SourceType,
+) -> Result<(CapturedImage, WaylandSourceBinding), PlatformError> {
     let WaylandScreencastSession {
         pw_fd,
         node_id,
         had_saved_token,
+        source_type: stream_source_type,
+        stream_id,
+        mapping_id,
+        position,
+        logical_size,
         session,
         ..
     } = open_screencast_session_with_options(source_type, CursorMode::Hidden).await?;
@@ -260,6 +358,16 @@ async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage
         }
     }
 
+    let binding = WaylandSourceBinding {
+        source_type: stream_source_type,
+        stream_id,
+        mapping_id,
+        position,
+        logical_size,
+        pixel_width: width,
+        pixel_height: height,
+    };
+
     let outputs = match query_wayland_outputs() {
         Ok(outs) if !outs.is_empty() => outs,
         Ok(_) => vec![fallback_output(width, height)],
@@ -269,12 +377,15 @@ async fn capture_via_screencast(source_type: SourceType) -> Result<CapturedImage
         }
     };
 
-    Ok(CapturedImage {
-        rgba,
-        width,
-        height,
-        outputs,
-    })
+    Ok((
+        CapturedImage {
+            rgba,
+            width,
+            height,
+            outputs,
+        },
+        binding,
+    ))
 }
 
 type CapturedFrame = (Vec<u8>, u32, u32);
@@ -437,16 +548,27 @@ fn grab_single_pipewire_frame(
                 return;
             }
 
-            let stride = datas[0].chunk().stride().max((w * 4) as i32) as usize;
-            let size = datas[0].chunk().size() as usize;
+            let data_type_invalid = datas[0].type_() == spa::buffer::DataType::Invalid;
+            let chunk = datas[0].chunk();
+            let corrupted = chunk.flags().contains(spa::buffer::ChunkFlags::CORRUPTED);
+            let chunk_offset = chunk.offset();
+            let chunk_size = chunk.size();
+            let stride = chunk.stride();
             let Some(slice) = datas[0].data() else {
                 return;
             };
-            if slice.is_empty() || size == 0 {
-                return;
-            }
 
-            match convert_spa_to_rgba(fmt.format(), slice, w, h, stride) {
+            match extract_and_convert_spa_frame(
+                fmt.format(),
+                slice,
+                data_type_invalid,
+                corrupted,
+                chunk_offset,
+                chunk_size,
+                stride,
+                w,
+                h,
+            ) {
                 Ok(rgba) => {
                     if let Ok(mut guard) = user_data.captured.lock() {
                         *guard = Some((rgba, w, h));
@@ -467,6 +589,7 @@ fn grab_single_pipewire_frame(
                     }
                 }
                 Err(msg) => {
+                    debug!(reason = %msg, "ignoring invalid or incomplete PipeWire frame");
                     if let Ok(mut guard) = user_data.error.lock() {
                         *guard = Some(msg);
                     }
@@ -624,27 +747,90 @@ fn grab_single_pipewire_frame(
     ))
 }
 
-/// Converte um buffer de vídeo SPA do PipeWire respeitando o stride de linha para pixels RGBA packed.
-/// Input: `fmt` (`VideoFormat`), `data` (`&[u8]`), `width` (`u32`), `height` (`u32`), `stride` (`usize`) | Output: `Result<Vec<u8>, String>` com bytes RGBA
-fn convert_spa_to_rgba(
+/// Valida o contrato de `spa_chunk` (`DataType`, flags, `offset`, `size`, `stride` e limites) antes de alocar e converter para RGBA8.
+/// Input: formato, bytes mapeados, sinalizadores de erro, `chunk_offset`, `chunk_size`, `stride`, `width` e `height` | Output: `Result<Vec<u8>, String>`.
+#[allow(clippy::too_many_arguments)]
+fn extract_and_convert_spa_frame(
     fmt: VideoFormat,
-    data: &[u8],
+    mapped: &[u8],
+    data_type_invalid: bool,
+    corrupted: bool,
+    chunk_offset: u32,
+    chunk_size: u32,
+    stride: i32,
     width: u32,
     height: u32,
-    stride: usize,
 ) -> Result<Vec<u8>, String> {
-    let w = width as usize;
-    let h = height as usize;
-    let mut rgba = vec![0u8; w * h * 4];
+    if data_type_invalid {
+        return Err("PipeWire SPA buffer has Invalid data type".to_string());
+    }
+    if corrupted {
+        return Err("PipeWire SPA chunk is flagged CORRUPTED".to_string());
+    }
+    if !matches!(
+        fmt,
+        VideoFormat::BGRx | VideoFormat::BGRA | VideoFormat::RGBx | VideoFormat::RGBA
+    ) {
+        return Err(format!("unsupported PipeWire video format: {fmt:?}"));
+    }
 
+    let w = usize::try_from(width).map_err(|_| "frame width overflow".to_string())?;
+    let h = usize::try_from(height).map_err(|_| "frame height overflow".to_string())?;
+    if w == 0 || h == 0 {
+        return Err("PipeWire frame has zero width or height".to_string());
+    }
+
+    let row_bytes = w
+        .checked_mul(4)
+        .ok_or_else(|| "PipeWire row byte size overflow".to_string())?;
+    let rgba_len = row_bytes
+        .checked_mul(h)
+        .ok_or_else(|| "PipeWire frame RGBA size overflow".to_string())?;
+    if rgba_len > MAX_FRAME_RGBA_BYTES {
+        return Err(format!(
+            "PipeWire frame exceeds max limit ({rgba_len} > {MAX_FRAME_RGBA_BYTES})"
+        ));
+    }
+
+    let stride_usize = usize::try_from(stride)
+        .ok()
+        .filter(|&s| s >= row_bytes)
+        .ok_or_else(|| format!("invalid PipeWire stride {stride} for row_bytes {row_bytes}"))?;
+
+    if mapped.is_empty() || chunk_size == 0 {
+        return Err("empty PipeWire SPA chunk or mapped buffer".to_string());
+    }
+
+    let offset = (chunk_offset as usize) % mapped.len();
+    let size =
+        usize::try_from(chunk_size).map_err(|_| "PipeWire chunk_size overflow".to_string())?;
+    let valid_end = offset
+        .checked_add(size)
+        .ok_or_else(|| "PipeWire chunk offset+size overflow".to_string())?;
+    if valid_end > mapped.len() {
+        return Err(format!(
+            "PipeWire chunk bounds [{offset}..{valid_end}] exceed mapped len {}",
+            mapped.len()
+        ));
+    }
+
+    let valid_slice = &mapped[offset..valid_end];
+    let required_bytes = (h - 1)
+        .checked_mul(stride_usize)
+        .and_then(|base| base.checked_add(row_bytes))
+        .ok_or_else(|| "PipeWire required frame bytes overflow".to_string())?;
+    if valid_slice.len() < required_bytes {
+        return Err(format!(
+            "PipeWire chunk valid bytes ({}) smaller than required frame layout ({required_bytes})",
+            valid_slice.len()
+        ));
+    }
+
+    let mut rgba = vec![0u8; rgba_len];
     for y in 0..h {
-        let src_row_start = y * stride;
-        let src_row_end = src_row_start + w * 4;
-        if src_row_end > data.len() {
-            return Err("PipeWire buffer smaller than expected video dimensions".to_string());
-        }
-        let src = &data[src_row_start..src_row_end];
-        let dst = &mut rgba[y * w * 4..(y + 1) * w * 4];
+        let src_row_start = y * stride_usize;
+        let src = &valid_slice[src_row_start..src_row_start + row_bytes];
+        let dst = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
 
         match fmt {
             VideoFormat::BGRx => {
@@ -689,9 +875,7 @@ fn convert_spa_to_rgba(
             VideoFormat::RGBA => {
                 dst.copy_from_slice(src);
             }
-            other => {
-                return Err(format!("unsupported PipeWire video format: {other:?}"));
-            }
+            _ => unreachable!("validated supported VideoFormat upfront"),
         }
     }
 
@@ -952,5 +1136,136 @@ mod tests {
 
         let opaque = vec![255u8; (w * h * 4) as usize];
         assert!(trim_transparent_border(&opaque, w, h).is_none());
+    }
+
+    #[test]
+    fn spa_chunk_validation_respects_offset_bounds_flags_and_stride() {
+        // 2x2 BGRx with stride=12 (4 padding bytes per row), placed at offset=8 in a 40-byte map
+        let mut mapped = vec![0xEEu8; 40];
+        let valid_offset = 8usize;
+        // Row 0 (BGRx): pixel0=(10,20,30,0), pixel1=(40,50,60,0) -> RGB(30,20,10) & RGB(60,50,40)
+        mapped[valid_offset..valid_offset + 8].copy_from_slice(&[10, 20, 30, 0, 40, 50, 60, 0]);
+        // Row 1 at valid_offset + 12
+        mapped[valid_offset + 12..valid_offset + 20]
+            .copy_from_slice(&[70, 80, 90, 0, 100, 110, 120, 0]);
+
+        // Valid size = 12 (row0 stride) + 8 (row1) = 20
+        let rgba = extract_and_convert_spa_frame(
+            VideoFormat::BGRx,
+            &mapped,
+            false,
+            false,
+            valid_offset as u32,
+            20,
+            12,
+            2,
+            2,
+        )
+        .expect("valid offset+size should succeed");
+        assert_eq!(
+            rgba,
+            vec![
+                30, 20, 10, 255, 60, 50, 40, 255, // row 0
+                90, 80, 70, 255, 120, 110, 100, 255, // row 1
+            ]
+        );
+
+        // Wrapped ring offset (40 + 8 = 48 -> 48 % 40 = 8) still works
+        assert!(extract_and_convert_spa_frame(
+            VideoFormat::BGRx,
+            &mapped,
+            false,
+            false,
+            48,
+            20,
+            12,
+            2,
+            2,
+        )
+        .is_ok());
+
+        // Reject Invalid DataType
+        assert!(extract_and_convert_spa_frame(
+            VideoFormat::BGRx,
+            &mapped,
+            true,
+            false,
+            8,
+            20,
+            12,
+            2,
+            2,
+        )
+        .is_err());
+
+        // Reject CORRUPTED chunk flag
+        assert!(extract_and_convert_spa_frame(
+            VideoFormat::BGRx,
+            &mapped,
+            false,
+            true,
+            8,
+            20,
+            12,
+            2,
+            2,
+        )
+        .is_err());
+
+        // Reject offset+size exceeding mapped len even though mapped has room at offset 0
+        assert!(extract_and_convert_spa_frame(
+            VideoFormat::BGRx,
+            &mapped,
+            false,
+            false,
+            32,
+            16,
+            8,
+            2,
+            2,
+        )
+        .is_err());
+
+        // Reject chunk_size smaller than last row end even though mapped has remaining bytes
+        assert!(extract_and_convert_spa_frame(
+            VideoFormat::BGRx,
+            &mapped,
+            false,
+            false,
+            8,
+            19,
+            12,
+            2,
+            2,
+        )
+        .is_err());
+
+        // Reject stride < width * 4
+        assert!(extract_and_convert_spa_frame(
+            VideoFormat::BGRx,
+            &mapped,
+            false,
+            false,
+            8,
+            20,
+            4,
+            2,
+            2,
+        )
+        .is_err());
+
+        // Reject oversized dimensions (> 256 MiB ceiling) before allocating
+        assert!(extract_and_convert_spa_frame(
+            VideoFormat::BGRx,
+            &mapped,
+            false,
+            false,
+            0,
+            20,
+            100_000,
+            20_000,
+            20_000,
+        )
+        .is_err());
     }
 }

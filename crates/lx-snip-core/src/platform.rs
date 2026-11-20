@@ -1,12 +1,14 @@
 //! Módulo: `platform`
-//! Objetivos: Definir traits e estruturas de abstração entre backends de captura e área de transferência (Wayland e X11).
-//! Principais itens: `PlatformFuture`, `OutputGeometry`, `CapturedImage`, `PlatformError`, `CaptureBackend` e `ClipboardBackend`.
-//! Última alteração: 2026-11-19
+//! Objetivos: Definir traits e estruturas de abstração entre backends de captura e área de transferência (`Wayland`, `X11` e `Windows`).
+//! Principais itens: `PlatformFuture`, `OutputGeometry`, `WindowBounds`, `CapturedImage`, `PlatformError`, `CaptureBackend` e `ClipboardBackend`.
+//! Última alteração: 2026-11-20
 
 use std::future::Future;
 use std::pin::Pin;
 
 use thiserror::Error;
+
+use crate::scene::Rect;
 
 /// Futuro assíncrono em `Box` usado pelos traits de plataforma compatíveis com dispatch dinâmico.
 pub type PlatformFuture<'a, T> =
@@ -16,11 +18,11 @@ pub type PlatformFuture<'a, T> =
 /// Armazena: `name`, coordenadas `x`/`y`, dimensões `width`/`height` e `scale_factor` | Principais métodos: nenhum (tipo de dados).
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputGeometry {
-    /// Nome da saída no compositor ou RandR (ex.: `DP-1`, `eDP-1`).
+    /// Nome da saída no compositor ou sistema (`DP-1`, `eDP-1`, `\\.\DISPLAY1`).
     pub name: String,
-    /// Origem X no espaço global de coordenadas do compositor.
+    /// Origem X no espaço global de coordenadas do desktop capturado.
     pub x: i32,
-    /// Origem Y no espaço global de coordenadas do compositor.
+    /// Origem Y no espaço global de coordenadas do desktop capturado.
     pub y: i32,
     /// Largura da saída em pixels.
     pub width: u32,
@@ -28,6 +30,16 @@ pub struct OutputGeometry {
     pub height: u32,
     /// Fator de escala configurado no monitor (ex.: `1.0`, `2.0`).
     pub scale_factor: f64,
+}
+
+/// Representa o identificador nativo e o retângulo delimitador de uma janela visível no desktop.
+/// Armazena: identificador `id` e `rect` em coordenadas de pixels relativos à captura | Principais métodos: nenhum (tipo de dados).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowBounds {
+    /// Identificador nativo da janela (`u32` XID no X11 ou `HWND` como `u64` no Windows).
+    pub id: u64,
+    /// Retângulo delimitador na tela em pixels da imagem capturada.
+    pub rect: Rect,
 }
 
 /// Representa uma imagem capturada em memória no formato RGBA8 não pré-multiplicado.

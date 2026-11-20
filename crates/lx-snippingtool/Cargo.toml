@@ -18,6 +18,13 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
+iced = { workspace = true }
+image = { workspace = true }
+tiny-skia = { workspace = true }
+directories = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { workspace = true }
 pipewire = { workspace = true }
 zbus = { workspace = true }
@@ -26,13 +33,11 @@ wayland-protocols = { workspace = true }
 x11rb = { workspace = true }
 wl-clipboard-rs = { workspace = true }
 ksni = { workspace = true }
-iced = { workspace = true }
 iced_layershell = { workspace = true }
-image = { workspace = true }
-tiny-skia = { workspace = true }
-directories = { workspace = true }
 libc = { workspace = true }
-uuid = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
 
 [package.metadata.deb]
 maintainer = "lx-snippingtool contributors"
